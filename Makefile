@@ -36,6 +36,10 @@ bundle: build
 		codesign --force --options runtime --sign "$(SIGN_ID)" --identifier com.tenequm.Blackbox --timestamp --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	else \
 		echo "No Developer ID found, using ad-hoc signing"; \
+		find "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework" -type f \( -name "*.xpc" -o -name "Autoupdate" -o -name "Updater" -o -name "Downloader" -o -name "Installer" -o -name "Sparkle" \) | while read f; do \
+			codesign --force --sign - "$$f"; \
+		done; \
+		codesign --force --sign - "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
 		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
 		codesign --force --sign - --identifier com.tenequm.Blackbox --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	fi
@@ -72,13 +76,23 @@ release: dmg
 	xcrun stapler staple "$(BUILD_DIR)/$(DMG_NAME)"
 	@echo "Notarized: $(BUILD_DIR)/$(DMG_NAME)"
 
+# Testing.framework ships inside the selected developer dir. Package.swift
+# deliberately carries no framework search paths (a mismatched CLT there breaks
+# every @Test macro), so point the compiler at it here instead - without this,
+# a Command-Line-Tools-only machine fails to build ("no such module 'Testing'")
+# and then to dlopen the test bundle (Testing + its lib_TestingInterop.dylib are
+# both @rpath-linked, so each needs a runtime search path too).
+TESTING_FRAMEWORK_DIR = $(shell xcode-select -p)/Library/Developer/Frameworks
+TESTING_LIB_DIR = $(shell xcode-select -p)/Library/Developer/usr/lib
+TEST_FLAGS = $(if $(wildcard $(TESTING_FRAMEWORK_DIR)/Testing.framework),-Xswiftc -F -Xswiftc "$(TESTING_FRAMEWORK_DIR)" -Xlinker -F -Xlinker "$(TESTING_FRAMEWORK_DIR)" -Xlinker -rpath -Xlinker "$(TESTING_FRAMEWORK_DIR)" -Xlinker -rpath -Xlinker "$(TESTING_LIB_DIR)")
+
 test:
-	swift test --disable-xctest
+	swift test --disable-xctest $(TEST_FLAGS)
 
 smoke-install: install
 
 smoke-test: bundle
-	BLACKBOX_RUN_HARDWARE_SMOKE=1 BLACKBOX_SMOKE_APP_PATH="$(PWD)/$(APP_BUNDLE)" swift test --disable-xctest
+	BLACKBOX_RUN_HARDWARE_SMOKE=1 BLACKBOX_SMOKE_APP_PATH="$(PWD)/$(APP_BUNDLE)" swift test --disable-xctest $(TEST_FLAGS)
 
 smoke: smoke-test
 
