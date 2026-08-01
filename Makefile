@@ -36,6 +36,10 @@ bundle: build
 		codesign --force --options runtime --sign "$(SIGN_ID)" --identifier com.tenequm.Blackbox --timestamp --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	else \
 		echo "No Developer ID found, using ad-hoc signing"; \
+		find "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework" -type f \( -name "*.xpc" -o -name "Autoupdate" -o -name "Updater" -o -name "Downloader" -o -name "Installer" -o -name "Sparkle" \) | while read f; do \
+			codesign --force --sign - "$$f"; \
+		done; \
+		codesign --force --sign - "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
 		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
 		codesign --force --sign - --identifier com.tenequm.Blackbox --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	fi

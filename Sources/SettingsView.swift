@@ -1,7 +1,9 @@
 import AVFoundation
+import AppKit
 import Security
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
 
 struct SettingsView: View {
@@ -13,6 +15,7 @@ struct SettingsView: View {
   @AppStorage("notifyOnStart") private var notifyOnStart = true
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
+  @State private var excludedBundleIDs: [String] = ExcludedAppsStore.load()
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
   @State private var audioRecordingGranted = false
@@ -23,6 +26,7 @@ struct SettingsView: View {
   var body: some View {
     Form {
       generalSection
+      excludedAppsSection
       permissionsSection
       recordingsSection
       transcriptionSection
@@ -85,6 +89,75 @@ struct SettingsView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
     }
+  }
+
+  // MARK: - Excluded Apps
+
+  private var excludedAppsSection: some View {
+    Section("Excluded Apps") {
+      Text("Auto-recording is skipped when any of these apps are active.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+      if excludedBundleIDs.isEmpty {
+        Text("No apps excluded")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      } else {
+        ForEach(excludedBundleIDs, id: \.self) { bundleID in
+          HStack(spacing: 8) {
+            if let icon = ExcludedAppsStore.icon(forBundleID: bundleID) {
+              Image(nsImage: icon)
+                .resizable()
+                .frame(width: 20, height: 20)
+            } else {
+              Image(systemName: "app.dashed")
+                .frame(width: 20, height: 20)
+                .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+              Text(ExcludedAppsStore.displayName(forBundleID: bundleID))
+              Text(bundleID)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+              remove(bundleID: bundleID)
+            } label: {
+              Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove")
+          }
+        }
+      }
+
+      HStack {
+        Spacer()
+        Button("Add App...") { pickExcludedApp() }
+      }
+    }
+  }
+
+  private func pickExcludedApp() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = [.application]
+    panel.directoryURL = URL(fileURLWithPath: "/Applications")
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    guard let bundleID = Bundle(url: url)?.bundleIdentifier else { return }
+    if !excludedBundleIDs.contains(bundleID) {
+      excludedBundleIDs.append(bundleID)
+      ExcludedAppsStore.save(excludedBundleIDs)
+    }
+  }
+
+  private func remove(bundleID: String) {
+    excludedBundleIDs.removeAll { $0 == bundleID }
+    ExcludedAppsStore.save(excludedBundleIDs)
   }
 
   // MARK: - Permissions
@@ -329,3 +402,39 @@ enum KeychainHelper {
 
 let defaultSaveDirectoryPath =
   NSHomeDirectory() + "/Library/Application Support/Blackbox/Recordings"
+
+// MARK: - Excluded Apps Store
+
+enum ExcludedAppsStore {
+  private static let key = "excludedBundleIDs"
+
+  static func load() -> [String] {
+    (UserDefaults.standard.array(forKey: key) as? [String]) ?? []
+  }
+
+  static func save(_ ids: [String]) {
+    UserDefaults.standard.set(ids, forKey: key)
+  }
+
+  static func displayName(forBundleID bundleID: String) -> String {
+    if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+      let name = Bundle(url: app)?.localizedInfoDictionary?["CFBundleDisplayName"] as? String
+        ?? Bundle(url: app)?.infoDictionary?["CFBundleName"] as? String
+    {
+      return name
+    }
+    if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+      let name = running.localizedName
+    {
+      return name
+    }
+    return bundleID
+  }
+
+  static func icon(forBundleID bundleID: String) -> NSImage? {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+      return NSWorkspace.shared.icon(forFile: url.path)
+    }
+    return nil
+  }
+}

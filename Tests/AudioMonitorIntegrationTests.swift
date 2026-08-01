@@ -186,6 +186,107 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("excluded bundle ID does not trigger auto recording")
+  func excludedBundleIDDoesNotTriggerAutoRecording() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.superduper.superwhisper"]
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.superduper.superwhisper"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("excluded helper subprocess is resolved to parent and excluded")
+  func excludedHelperSubprocessResolvesToParent() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.google.Chrome"]
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.google.Chrome.helper.renderer"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("non-excluded callers still trigger auto recording while list is active")
+  func nonExcludedCallersStillTriggerWhileListActive() async throws {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.superduper.superwhisper"]
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.superduper.superwhisper", "com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    // Zoom is the only non-excluded caller -> single-caller path, bundleID set.
+    #expect(session.configuration.bundleID == "com.example.Zoom")
+    #expect(monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("removing bundle ID from exclusion allows next poll to record")
+  func removingBundleIDFromExclusionAllowsRecording() async throws {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.example.Zoom"]
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+
+    // User removes the exclusion. Settings reload runs every 5s in live code; drive
+    // it explicitly by advancing past the reload interval.
+    harness.settings.excludedBundleIDs = []
+    harness.clock.advance(by: .seconds(5))
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    #expect(session.configuration.bundleID == "com.example.Zoom")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("manual recording ignores exclusion list")
+  func manualRecordingIgnoresExclusionList() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedBundleIDs = ["com.superduper.superwhisper"]
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    #expect(monitor.isManualRecording)
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("inactive polling does not restart grace countdown forever")
   func inactivePollingDoesNotRestartGraceCountdownForever() async throws {
     let harness = MonitorHarness()

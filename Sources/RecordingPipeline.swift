@@ -303,11 +303,12 @@ final class RecordingPipeline: @unchecked Sendable {
     // Safe to capture nonisolated: finishWriting() is the terminal writer op,
     // and the main path awaits its completion before any further access.
     nonisolated(unsafe) let writerForTimeout = capturedWriter
-    let timeoutTask = Task.detached {
+    let timeoutBlock: @Sendable () async throws -> Void = {
       try await Task.sleep(for: .seconds(5))
       Log.error(Log.recorder, "recorder", "finishWriting timed out after 5s, cancelling")
       writerForTimeout.cancelWriting()
     }
+    let timeoutTask = Task.detached(operation: timeoutBlock)
     await capturedWriter.finishWriting()
     timeoutTask.cancel()
 

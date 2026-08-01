@@ -190,7 +190,8 @@ final class MonitorHarness {
     saveDirectory: FileManager.default.temporaryDirectory,
     notifyOnStart: true,
     notifyOnSaved: true,
-    notifyOnError: true
+    notifyOnError: true,
+    excludedBundleIDs: []
   )
   var activeCallers: [String?] = []
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
@@ -211,7 +212,8 @@ final class MonitorHarness {
               saveDirectory: FileManager.default.temporaryDirectory,
               notifyOnStart: true,
               notifyOnSaved: true,
-              notifyOnError: true
+              notifyOnError: true,
+              excludedBundleIDs: []
             )
         },
         microphoneAuthorizationStatus: { [weak self] in

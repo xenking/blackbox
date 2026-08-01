@@ -72,6 +72,10 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnStart: Bool
   var notifyOnSaved: Bool
   var notifyOnError: Bool
+  /// Bundle IDs to exclude from auto-recording call detection.
+  /// Helper subprocesses (e.g., `*.helper.*`) are resolved to their parent before compare.
+  /// Manual recording ignores this list.
+  var excludedBundleIDs: [String]
 }
 
 struct AudioMonitorDependencies {
@@ -99,12 +103,14 @@ struct AudioMonitorDependencies {
             ?? URL(fileURLWithPath: defaultSaveDirectoryPath),
           notifyOnStart: false,
           notifyOnSaved: false,
-          notifyOnError: false
+          notifyOnError: false,
+          excludedBundleIDs: []
         )
       }
 
       let defaults = UserDefaults.standard
       let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
+      let excluded = (defaults.array(forKey: "excludedBundleIDs") as? [String]) ?? []
       return AudioMonitorSettings(
         autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
         gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
@@ -112,7 +118,8 @@ struct AudioMonitorDependencies {
         saveDirectory: URL(fileURLWithPath: path),
         notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
         notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true
+        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
+        excludedBundleIDs: excluded
       )
     },
     microphoneAuthorizationStatus: {

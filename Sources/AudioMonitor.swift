@@ -38,6 +38,9 @@ final class AudioMonitor {
   private var lastKnownMicRunning = false
   private var consecutiveInactivePolls = 0
   private var continuityCooldownUntil: Date?
+  /// Suppresses auto-recording restart from the polling recovery path.
+  /// Set on writer failure (.other) or explicit user stop. Reset when call state changes.
+  private var autoRecordingSuppressed = false
   @ObservationIgnored private let dependencies: AudioMonitorDependencies
 
   // Settings
@@ -48,6 +51,7 @@ final class AudioMonitor {
   var notifyOnStart: Bool = true
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
+  var excludedBundleIDs: Set<String> = []
 
   private var errorGeneration = 0
 
@@ -261,6 +265,7 @@ final class AudioMonitor {
   }
 
   func forceStopAutoRecording() {
+    autoRecordingSuppressed = true
     cancelGracePeriod()
     stopAutoRecording()
   }
@@ -290,12 +295,38 @@ final class AudioMonitor {
 
   // MARK: - Call Detection (macOS 14.2+)
 
+  /// Drop callers whose (parent-resolved) bundle ID is on the user's exclusion list.
+  /// Unknown bundle IDs (nil) are never excluded — we still treat them as calls.
+  private func filterExcluded(_ callers: [String?]) -> [String?] {
+    guard !excludedBundleIDs.isEmpty else { return callers }
+    var dropped: [String] = []
+    let filtered = callers.filter { caller in
+      guard let caller else { return true }
+      let parent = Self.resolveParentBundleID(caller)
+      let exclude =
+        excludedBundleIDs.contains(caller) || excludedBundleIDs.contains(parent)
+      if exclude {
+        dropped.append(parent == caller ? caller : "\(caller)→\(parent)")
+      }
+      return !exclude
+    }
+    if !dropped.isEmpty {
+      Log.info(
+        Log.monitor, "monitor",
+        "exclusion filter dropped \(dropped.count) caller(s): [\(dropped.joined(separator: ", "))] kept=\(filtered.count)"
+      )
+    }
+    return filtered
+  }
+
   private func setupCallDetection() {
-    let callers = dependencies.findActiveCallingProcesses()
+    let rawCallers = dependencies.findActiveCallingProcesses()
+    let callers = filterExcluded(rawCallers)
     lastKnownMicRunning = !callers.isEmpty
+    let ids = callers.map { $0 ?? "nil" }.joined(separator: ", ")
     Log.info(
       Log.monitor, "monitor",
-      "call detection started: polling every 3s, activeCallers=\(callers.count)"
+      "call detection started: polling every 3s, activeCallers=\(callers.count) raw=\(rawCallers.count) ids=[\(ids)]"
     )
 
     // Check current state in case app starts mid-call
@@ -318,20 +349,26 @@ final class AudioMonitor {
   /// Re-evaluate call state by checking which external processes have active calls.
   /// Called from polling loop every 3 seconds.
   private func evaluateCallState() {
-    let callers = dependencies.findActiveCallingProcesses()
+    let rawCallers = dependencies.findActiveCallingProcesses()
+    let callers = filterExcluded(rawCallers)
     let running = !callers.isEmpty
 
     if running {
       consecutiveInactivePolls = 0
       continuityCooldownUntil = nil
       if running != lastKnownMicRunning {
+        let ids = callers.map { $0 ?? "nil" }.joined(separator: ", ")
         Log.info(
           Log.monitor, "monitor",
-          "call state changed: activeCallers=\(callers.count), running=\(running)")
+          "call state changed: activeCallers=\(callers.count) raw=\(rawCallers.count) running=true ids=[\(ids)]"
+        )
         lastKnownMicRunning = true
+        autoRecordingSuppressed = false
         let bundleID = callers.count == 1 ? callers.first ?? nil : nil
         handleMicBecameActive(appBundleID: bundleID)
-      } else if autoRecord, autoRecorder == nil, !isRecording, !isManualRecording {
+      } else if autoRecord, autoRecorder == nil, !isRecording, !isManualRecording,
+        !autoRecordingSuppressed
+      {
         Log.info(Log.monitor, "monitor", "retrying auto-recording for active call")
         handleMicBecameActive(appBundleID: callers.first ?? nil)
       }
@@ -341,7 +378,8 @@ final class AudioMonitor {
     if running != lastKnownMicRunning {
       Log.info(
         Log.monitor, "monitor",
-        "call state changed: activeCallers=\(callers.count), running=\(running)")
+        "call state changed: activeCallers=\(callers.count) raw=\(rawCallers.count) running=false"
+      )
       lastKnownMicRunning = running
     }
 
@@ -371,18 +409,35 @@ final class AudioMonitor {
     return bundleID
   }
 
+  /// Find a running application by bundle ID, with case-insensitive fallback.
+  /// Handles Chromium helpers reporting mismatched-case bundle IDs
+  /// (e.g., "company.thebrowser.browser" vs registered "company.thebrowser.Browser").
+  private static func findRunningApp(bundleID: String) -> NSRunningApplication? {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
+      return app
+    }
+    let lowered = bundleID.lowercased()
+    return NSWorkspace.shared.runningApplications.first {
+      $0.bundleIdentifier?.lowercased() == lowered
+    }
+  }
+
+  /// Resolve a bundle ID to the correct-case version from running apps.
+  /// e.g., "company.thebrowser.browser" → "company.thebrowser.Browser"
+  private static func correctBundleID(_ bundleID: String) -> String {
+    findRunningApp(bundleID: bundleID)?.bundleIdentifier ?? bundleID
+  }
+
   /// Resolve a bundle ID to a human-readable app name.
   private static func resolveAppName(bundleID: String?) -> String {
     guard let bundleID else { return "Call" }
     let resolved = resolveParentBundleID(bundleID)
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: resolved).first,
-      let name = app.localizedName
-    {
+    if let app = findRunningApp(bundleID: resolved), let name = app.localizedName {
       return name
     }
     // Fallback: try original bundle ID if parent resolution found nothing
     if resolved != bundleID,
-      let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+      let app = findRunningApp(bundleID: bundleID),
       let name = app.localizedName
     {
       return name
@@ -393,6 +448,44 @@ final class AudioMonitor {
       return String(last)
     }
     return "Call"
+  }
+
+  /// Get the most relevant window title for an app (e.g., active meeting tab in a browser).
+  /// Requires Screen Recording permission for window name access.
+  private static func activeWindowTitle(forBundleID bundleID: String) -> String? {
+    guard let app = findRunningApp(bundleID: bundleID) else { return nil }
+    let pid = app.processIdentifier
+
+    guard
+      let windowList = CGWindowListCopyWindowInfo(
+        [.excludeDesktopElements], kCGNullWindowID
+      ) as? [[String: Any]]
+    else { return nil }
+
+    var titles: [String] = []
+    for window in windowList {
+      guard let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t,
+        ownerPID == pid,
+        let layer = window[kCGWindowLayer as String] as? Int,
+        layer == 0,
+        let name = window[kCGWindowName as String] as? String,
+        !name.isEmpty
+      else { continue }
+      titles.append(name)
+    }
+
+    guard !titles.isEmpty else { return nil }
+
+    // Prefer window with meeting-related keywords
+    let meetingKeywords = ["meet", "zoom", "teams", "huddle", "webex", "slack"]
+    if let meetingTitle = titles.first(where: { title in
+      let lower = title.lowercased()
+      return meetingKeywords.contains(where: { lower.contains($0) })
+    }) {
+      return meetingTitle
+    }
+
+    return titles.first
   }
 
   // MARK: - Auto Recording
@@ -412,8 +505,28 @@ final class AudioMonitor {
     // CATap permission is checked when AudioRecorder.start() creates the process tap.
     // If denied, the failure callback sets permissionNeeded = true.
 
-    autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
-    autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
+    // Resolve parent bundle ID and correct case from running apps
+    // (e.g., company.thebrowser.browser → company.thebrowser.Browser)
+    let parentBID = appBundleID.map { Self.resolveParentBundleID($0) }
+    let correctedBID = parentBID.map { Self.correctBundleID($0) }
+    autoRecordingBundleID = correctedBID
+    Log.info(
+      Log.monitor, "monitor",
+      "resolved bundleID: raw=\(appBundleID ?? "nil") corrected=\(correctedBID ?? "nil")"
+    )
+
+    let appName = Self.resolveAppName(bundleID: appBundleID)
+    // Enrich with window title (use correctedBID for lookup, not autoRecordingBundleID)
+    if let bid = correctedBID,
+      let windowTitle = Self.activeWindowTitle(forBundleID: bid),
+      windowTitle != appName
+    {
+      autoRecordingAppName = "\(appName) — \(windowTitle)"
+      Log.info(Log.monitor, "monitor", "enriched name: \(autoRecordingAppName ?? appName)")
+    } else {
+      autoRecordingAppName = appName
+    }
+
     loadSettings()
     startAutoRecording()
   }
@@ -580,6 +693,7 @@ final class AudioMonitor {
       autoRecordingBundleID = nil
       updateAutoState()
     case .other:
+      autoRecordingSuppressed = true
       setError("Recording interrupted")
       autoRecordingAppName = nil
       autoRecordingBundleID = nil
@@ -620,6 +734,15 @@ final class AudioMonitor {
     if notifyOnStart != settings.notifyOnStart { notifyOnStart = settings.notifyOnStart }
     if notifyOnSaved != settings.notifyOnSaved { notifyOnSaved = settings.notifyOnSaved }
     if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }
+    let nextExcluded = Set(settings.excludedBundleIDs)
+    if excludedBundleIDs != nextExcluded {
+      let list = nextExcluded.sorted().joined(separator: ", ")
+      Log.info(
+        Log.monitor, "monitor",
+        "excluded apps updated: count=\(nextExcluded.count) list=[\(list)]"
+      )
+      excludedBundleIDs = nextExcluded
+    }
 
     let nextMicPermissionNeeded =
       micEnabled && dependencies.microphoneAuthorizationStatus() != .authorized
