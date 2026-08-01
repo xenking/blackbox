@@ -60,6 +60,7 @@ final class AudioMonitor {
   var notifyOnSaved: Bool = true
   var notifyOnError: Bool = true
   var excludedBundleIDs: Set<String> = []
+  var excludedTitlePatterns: Set<String> = []
 
   private var errorGeneration = 0
 
@@ -422,14 +423,56 @@ final class AudioMonitor {
     handleMicBecameInactive()
   }
 
-  /// Active callers resolved to parent bundle IDs, with excluded apps removed.
-  /// Single source for "who is calling" - exclusion must also apply to
-  /// suppression seeding, so an excluded bundle never occupies the slot.
+  /// Active callers resolved to parent bundle IDs, with excluded apps and
+  /// excluded window titles removed. Single source for "who is calling" -
+  /// exclusion must also apply to suppression seeding, so an excluded bundle
+  /// never occupies the slot.
   private func resolvedActiveCallers() -> [String] {
     dependencies.findActiveCallingProcesses()
       .compactMap { $0 }
-      .map(Self.resolveParentBundleID)
-      .filter { !excludedBundleIDs.contains($0) }
+      .map(canonicalBundleID)
+      .filter { !excludedBundleIDs.contains($0) && !hasExcludedWindowTitle($0) }
+  }
+
+  /// Parent bundle ID in the case the app is actually registered under, so
+  /// caller sets, `suppressedBundleID`, and window lookups all agree on one
+  /// spelling.
+  private func canonicalBundleID(_ bundleID: String) -> String {
+    let parent = Self.resolveParentBundleID(bundleID)
+    return findRunningApplication(bundleID: parent)?.bundleIdentifier ?? parent
+  }
+
+  /// True when any window title of `bundleID` contains an excluded pattern.
+  /// Skipped entirely when no patterns are set - `CGWindowListCopyWindowInfo`
+  /// runs on every 3s poll otherwise.
+  private func hasExcludedWindowTitle(_ bundleID: String) -> Bool {
+    guard !excludedTitlePatterns.isEmpty else { return false }
+    let titles = dependencies.windowTitles(bundleID).map { $0.lowercased() }
+    guard
+      let matched = titles.first(where: { title in
+        excludedTitlePatterns.contains { title.contains($0) }
+      })
+    else { return false }
+    Log.info(
+      Log.monitor, "monitor",
+      "caller \(bundleID) excluded by window title: \"\(matched)\"")
+    return true
+  }
+
+  /// Appends the calling app's window title to the recording name, so browser
+  /// calls get "Arc — Weekly sync" instead of a wall of identical "Arc" entries.
+  /// Falls back to the bare app name when no window title is readable (no
+  /// Screen Recording permission, or a windowless helper).
+  private func enrichedAppName(_ appName: String, bundleID: String) -> String {
+    let titles = dependencies.windowTitles(bundleID)
+    let meetingKeywords = ["meet", "zoom", "teams", "huddle", "webex", "slack"]
+    let picked =
+      titles.first { title in
+        let lower = title.lowercased()
+        return meetingKeywords.contains { lower.contains($0) }
+      } ?? titles.first
+    guard let picked, picked != appName else { return appName }
+    return "\(appName) — \(picked.prefix(80))"
   }
 
   /// First currently-active caller resolved to its parent bundle ID. Used by
@@ -454,14 +497,11 @@ final class AudioMonitor {
   private static func resolveAppName(bundleID: String?) -> String {
     guard let bundleID else { return "Call" }
     let resolved = resolveParentBundleID(bundleID)
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: resolved).first,
-      let name = app.localizedName
-    {
+    if let app = findRunningApplication(bundleID: resolved), let name = app.localizedName {
       return name
     }
     // Fallback: try original bundle ID if parent resolution found nothing
-    if resolved != bundleID,
-      let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+    if resolved != bundleID, let app = findRunningApplication(bundleID: bundleID),
       let name = app.localizedName
     {
       return name
@@ -491,14 +531,19 @@ final class AudioMonitor {
     // Screen Recording permission is checked when AudioRecorder.start() creates
     // the SCStream. If denied, the failure callback sets permissionNeeded = true.
 
-    autoRecordingBundleID = appBundleID.map { Self.resolveParentBundleID($0) }
+    autoRecordingBundleID = appBundleID.map(canonicalBundleID)
     autoRecordingAppName = Self.resolveAppName(bundleID: appBundleID)
     loadSettings()
     // Re-check against the freshly loaded set: the poll that got us here may
     // have filtered with exclusions up to 5s stale.
-    if let bundleID = autoRecordingBundleID, excludedBundleIDs.contains(bundleID) {
-      Log.info(Log.monitor, "monitor", "auto-recording skipped: \(bundleID) is excluded")
-      return
+    if let bundleID = autoRecordingBundleID {
+      if excludedBundleIDs.contains(bundleID) {
+        Log.info(Log.monitor, "monitor", "auto-recording skipped: \(bundleID) is excluded")
+        return
+      }
+      if hasExcludedWindowTitle(bundleID) { return }
+      autoRecordingAppName = enrichedAppName(
+        autoRecordingAppName ?? "Call", bundleID: bundleID)
     }
     startAutoRecording()
   }
@@ -731,6 +776,9 @@ final class AudioMonitor {
     if notifyOnError != settings.notifyOnError { notifyOnError = settings.notifyOnError }
     if excludedBundleIDs != settings.excludedBundleIDs {
       excludedBundleIDs = settings.excludedBundleIDs
+    }
+    if excludedTitlePatterns != settings.excludedTitlePatterns {
+      excludedTitlePatterns = settings.excludedTitlePatterns
     }
 
     let nextMicPermissionNeeded =

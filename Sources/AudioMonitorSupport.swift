@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import CoreAudio
 import UserNotifications
 
@@ -71,13 +72,56 @@ struct AudioMonitorSettings: Sendable {
   var notifyOnError: Bool
   var namePrefixTemplate: String = ""
   var excludedBundleIDs: Set<String> = []
+  /// Lowercased substrings matched against the window titles of a calling app.
+  /// A caller whose any open window title contains one of these never triggers
+  /// auto-recording - this is how a single browser tab (whose title is the
+  /// window title) is excluded without excluding the whole browser.
+  var excludedTitlePatterns: Set<String> = []
 
-  /// Parses the comma-separated `excludedBundleIDs` UserDefaults value.
-  /// Single source of truth for the storage format (also written by SettingsView).
+  /// Parses a comma-separated UserDefaults list value (`excludedBundleIDs`,
+  /// `excludedTitlePatterns`). Single source of truth for the storage format
+  /// (also written by SettingsView).
   static func parseBundleIDList(_ raw: String) -> [String] {
     raw.split(separator: ",")
       .map { $0.trimmingCharacters(in: .whitespaces) }
       .filter { !$0.isEmpty }
+  }
+}
+
+/// Titles of an app's on-screen windows (layer 0 only, so menu-bar items and
+/// overlays are skipped). Needs Screen Recording permission for `kCGWindowName`
+/// - the app already requires it for SCStream capture. Browsers report the
+/// active tab of each window here, which is what makes tab-title exclusion work.
+@MainActor
+func liveWindowTitles(forBundleID bundleID: String) -> [String] {
+  guard let app = findRunningApplication(bundleID: bundleID) else { return [] }
+  let pid = app.processIdentifier
+  guard
+    let windows = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+      as? [[String: Any]]
+  else { return [] }
+
+  return windows.compactMap { window in
+    guard let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+      let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
+      let name = window[kCGWindowName as String] as? String, !name.isEmpty
+    else { return nil }
+    return name
+  }
+}
+
+/// Look up a running app by bundle ID, falling back to a case-insensitive
+/// match. Chromium-based browsers report helper bundle IDs in a different case
+/// than the registered one (e.g. `company.thebrowser.browser` vs
+/// `company.thebrowser.Browser`), and the exact-match API misses those.
+@MainActor
+func findRunningApplication(bundleID: String) -> NSRunningApplication? {
+  if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
+    return app
+  }
+  let lowered = bundleID.lowercased()
+  return NSWorkspace.shared.runningApplications.first {
+    $0.bundleIdentifier?.lowercased() == lowered
   }
 }
 
@@ -104,6 +148,7 @@ struct AudioMonitorDependencies {
   var requestMicrophoneAccessIfNeeded: @MainActor () async -> Void
   var notifyPermissionLost: @MainActor () async -> Void
   var findActiveCallingProcesses: @MainActor () -> [String?]
+  var windowTitles: @MainActor (String) -> [String]
   var now: @MainActor () -> Date
   var sleep: @Sendable (Duration) async -> Void
 
@@ -138,7 +183,11 @@ struct AudioMonitorDependencies {
         namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
         excludedBundleIDs: Set(
           AudioMonitorSettings.parseBundleIDList(
-            defaults.string(forKey: "excludedBundleIDs") ?? ""))
+            defaults.string(forKey: "excludedBundleIDs") ?? "")),
+        excludedTitlePatterns: Set(
+          AudioMonitorSettings.parseBundleIDList(
+            defaults.string(forKey: "excludedTitlePatterns") ?? ""
+          ).map { $0.lowercased() })
       )
     },
     microphoneAuthorizationStatus: {
@@ -174,6 +223,7 @@ struct AudioMonitorDependencies {
         }
         .map { try? $0.bundleID }
     },
+    windowTitles: { liveWindowTitles(forBundleID: $0) },
     now: { Date() },
     sleep: { duration in
       try? await Task.sleep(for: duration)

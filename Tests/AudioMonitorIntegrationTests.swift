@@ -451,4 +451,103 @@ struct AudioMonitorIntegrationTests {
 
     await monitor.stopMonitoring()
   }
+
+  // MARK: - Excluded Window Titles
+
+  @Test("excluded window title blocks auto recording for that caller")
+  func excludedWindowTitleBlocksAutoRecording() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedTitlePatterns = ["standup"]
+    harness.windowTitles = ["com.example.Browser": ["Daily Standup - Google Meet"]]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Browser"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+    #expect(!monitor.isRecording)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("window title matching is case-insensitive")
+  func windowTitleMatchIsCaseInsensitive() async {
+    let harness = MonitorHarness()
+    harness.settings.excludedTitlePatterns = ["standup"]
+    harness.windowTitles = ["com.example.Browser": ["DAILY STANDUP"]]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Browser"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.isEmpty)
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("non-matching window title still records, enriched with the title")
+  func nonMatchingWindowTitleRecords() async throws {
+    let harness = MonitorHarness()
+    harness.settings.excludedTitlePatterns = ["standup"]
+    harness.windowTitles = ["com.example.Browser": ["Client call - Google Meet"]]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Browser"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    #expect(session.configuration.appName.contains("Client call - Google Meet"))
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("title exclusion is scoped to the matching caller")
+  func titleExclusionDoesNotAffectOtherCallers() async throws {
+    let harness = MonitorHarness()
+    harness.settings.excludedTitlePatterns = ["standup"]
+    harness.windowTitles = [
+      "com.example.Browser": ["Daily Standup"],
+      "com.example.Zoom": ["Client call"],
+    ]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Browser", "com.example.Zoom"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    #expect(session.configuration.bundleID == "com.example.Zoom")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("no title patterns configured leaves recording untouched")
+  func noTitlePatternsRecordsNormally() async {
+    let harness = MonitorHarness()
+    harness.windowTitles = ["com.example.Browser": ["Daily Standup"]]
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.activeCallers = ["com.example.Browser"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    await monitor.stopMonitoring()
+  }
 }

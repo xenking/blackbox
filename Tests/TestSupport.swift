@@ -253,6 +253,8 @@ final class MonitorHarness {
     notifyOnError: true
   )
   var activeCallers: [String?] = []
+  /// Window titles reported per bundle ID, for window-title exclusion tests.
+  var windowTitles: [String: [String]] = [:]
   var micAuthorizationStatus: AVAuthorizationStatus = .authorized
   private(set) var permissionLostNotifications = 0
 
@@ -282,6 +284,9 @@ final class MonitorHarness {
         },
         findActiveCallingProcesses: { [weak self] in
           self?.activeCallers ?? []
+        },
+        windowTitles: { [weak self] bundleID in
+          self?.windowTitles[bundleID] ?? []
         },
         now: { [clock] in
           clock.now()

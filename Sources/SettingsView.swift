@@ -17,6 +17,8 @@ struct SettingsView: View {
   @AppStorage("notifyOnSaved") private var notifyOnSaved = true
   @AppStorage("notifyOnError") private var notifyOnError = true
   @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
+  @AppStorage("excludedTitlePatterns") private var excludedTitlePatternsRaw = ""
+  @State private var newTitlePattern = ""
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
 
   @State private var audioRecordingGranted = false
@@ -28,6 +30,7 @@ struct SettingsView: View {
     Form {
       generalSection
       excludedAppsSection
+      excludedTitlesSection
       permissionsSection
       recordingsSection
       transcriptionSection
@@ -187,6 +190,60 @@ struct SettingsView: View {
         Button("Other…") {
           addExcludedAppViaOpenPanel()
         }
+      }
+    }
+  }
+
+  // MARK: - Excluded Window Titles
+
+  private var excludedTitlePatterns: [String] {
+    AudioMonitorSettings.parseBundleIDList(excludedTitlePatternsRaw)
+  }
+
+  private func addExcludedTitlePattern() {
+    let pattern = newTitlePattern.trimmingCharacters(in: .whitespaces)
+    // Commas are the storage separator, so a pattern can never contain one.
+    guard !pattern.isEmpty, !pattern.contains(","),
+      !excludedTitlePatterns.contains(where: { $0.caseInsensitiveCompare(pattern) == .orderedSame })
+    else { return }
+    excludedTitlePatternsRaw = (excludedTitlePatterns + [pattern]).joined(separator: ",")
+    newTitlePattern = ""
+  }
+
+  private func removeExcludedTitlePattern(_ pattern: String) {
+    excludedTitlePatternsRaw =
+      excludedTitlePatterns
+      .filter { $0 != pattern }
+      .joined(separator: ",")
+  }
+
+  private var excludedTitlesSection: some View {
+    Section("Excluded Window Titles") {
+      Text(
+        "Skip automatic recording when a calling app has a window whose title contains one of these. Matching is case-insensitive. Use it to exclude a single browser tab without excluding the whole browser."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      ForEach(excludedTitlePatterns, id: \.self) { pattern in
+        HStack {
+          Text(pattern)
+          Spacer()
+          Button {
+            removeExcludedTitlePattern(pattern)
+          } label: {
+            Image(systemName: "minus.circle.fill")
+              .foregroundStyle(.secondary)
+          }
+          .buttonStyle(.plain)
+        }
+      }
+
+      HStack {
+        TextField("Title contains…", text: $newTitlePattern)
+          .onSubmit { addExcludedTitlePattern() }
+        Button("Add") { addExcludedTitlePattern() }
+          .disabled(newTitlePattern.trimmingCharacters(in: .whitespaces).isEmpty)
       }
     }
   }
