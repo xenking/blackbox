@@ -369,6 +369,7 @@ struct AudioMonitorIntegrationTests {
     harness.clock.advance(by: .seconds(6))  // grace expires -> stop
     await settle()
     try #require(!monitor.isRecording, "auto-recording should have stopped")
+    #expect(!monitor.isSaving, "auto stop left the saving indicator on")
 
     await monitor.stopMonitoring()
   }
