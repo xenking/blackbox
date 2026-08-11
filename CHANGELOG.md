@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Recordings are now 3-track: track 0 is the full mix of your mic and the call audio, track 1 is your mic alone, track 2 is everything else. Track 0 matters because tools that take a single audio stream (`ffmpeg` without `-map`, most players' default track pick) read track 0, which previously held system audio only - so your own voice was missing from it. Mic and system tracks are remuxed without re-encoding, and the pass runs after recording stops, so a failure leaves the original file intact.
+- Transcription now transcribes your mic and the far end as two separate, concurrent Soniox jobs and merges them on one timeline. Your mic track is transcribed without diarization (it is one known speaker, labelled "Я"); the call audio is diarized. Because the mic track carries no cross-talk, your words are attributed exactly instead of being guessed from a mixed file.
+- Transcription language is configurable in Settings as a comma-separated list of ISO codes, defaulting to `ru`, and is sent to Soniox as language hints.
+- Track roles are recorded in `metadata.json`, so recordings made by any previous version keep playing, transcribing, and echo-cancelling correctly.
+
+### Fixed
+
+- App could be killed while opening a recording. Drawing the waveform decoded every PCM sample of the file into memory first - measured 1.43 GB for a 70-minute recording, scaling linearly, so a long call exhausted memory. The waveform is now reduced in a single streaming pass (1 MB for the same file). The waveform also no longer drops the tail of a recording.
+- Entering the Soniox API key could make the app unresponsive. The key was read from the Keychain inside SwiftUI property initializers, which re-run on every view construction - about ten times a second during playback - each one a blocking main-thread Keychain call that can raise a system authorisation dialog. Reads are now cached and Settings writes debounced instead of firing on every keystroke.
+- Transcription status never showed "Transcribing...": the poller matched a status string Soniox does not return (the real values are `queued`, `processing`, `completed`, `error`).
+- Long transcriptions were abandoned after 30 minutes of polling; the ceiling is now about two hours with backoff.
+- Transcripts of a single-speaker track collapsed into one giant segment stamped at its first timestamp. Segments now also break on pauses and sentence boundaries, and carry an end time.
+- Failed Soniox requests reported a bare HTTP status; the API's per-field validation message is now surfaced.
+
 ## [0.9.1] - 2026-07-03
 
 ### Fixed
