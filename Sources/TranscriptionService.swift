@@ -11,6 +11,10 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   var perAppBundleID: String?
   var perAppName: String?
   var trackCount: Int?
+  /// Role of each audio track, by index. Written since the 3-track format
+  /// (`mixed`, `mic`, `system`). Absent on recordings made before it, which are
+  /// resolved positionally by `RecordingTrackMap`.
+  var tracks: [RecordingTrackRole]?
 
   static let fileName = "metadata.json"
 
@@ -30,6 +34,71 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
     let data = try encoder.encode(self)
     try data.write(to: url, options: .atomic)
   }
+}
+
+// MARK: - Track Roles
+
+/// What a given audio track inside `audio.m4a` carries.
+///
+/// Track order is a *documented file-format* concern, not an internal detail:
+/// tools that take a single audio stream (`ffmpeg` without `-map`, most
+/// players' default track pick) read track 0, so track 0 must be the full mix.
+nonisolated enum RecordingTrackRole: String, Codable, Sendable {
+  /// Mic and system audio summed - the track a single-stream consumer gets.
+  case mixed
+  /// The local user's microphone alone.
+  case mic
+  /// Everything except the local user - the far end of the call.
+  case system
+  /// Legacy (pre-v0.7.0) per-app capture track.
+  case perApp
+}
+
+/// Resolves track index -> role for any recording this app has ever written.
+///
+/// Recordings carry their layout in `metadata.tracks`. Older ones do not, so
+/// they fall back to the positional layout that shipped with them. Every
+/// consumer (AEC reference selection, transcription, the player's track picker)
+/// must go through this rather than hard-coding indices, because the layouts
+/// disagree about what index 0 and the last index mean.
+nonisolated struct RecordingTrackMap: Sendable {
+  let roles: [RecordingTrackRole]
+
+  static func resolve(metadata: RecordingMetadata?, trackCount: Int) -> RecordingTrackMap {
+    if let declared = metadata?.tracks, declared.count == trackCount {
+      return RecordingTrackMap(roles: declared)
+    }
+    return RecordingTrackMap(roles: legacyRoles(trackCount: trackCount))
+  }
+
+  /// Layouts that shipped before `metadata.tracks` existed.
+  private static func legacyRoles(trackCount: Int) -> [RecordingTrackRole] {
+    switch trackCount {
+    // v0.7.0+ dual-track: system first, mic last.
+    case 2: return [.system, .mic]
+    // pre-v0.7.0 triple-track: display-wide, per-app, mic.
+    case 3: return [.system, .perApp, .mic]
+    case ..<1: return []
+    // Single track, or something unrecognised: treat the first as system and
+    // any surplus as mic so callers still find a plausible pair.
+    default: return [.system] + Array(repeating: .mic, count: trackCount - 1)
+    }
+  }
+
+  func index(of role: RecordingTrackRole) -> Int? {
+    roles.firstIndex(of: role)
+  }
+
+  var micIndex: Int? { index(of: .mic) }
+
+  /// Track carrying only the far end - the AEC far-end reference, and the
+  /// track to diarize when transcribing per-track. Prefers a dedicated per-app
+  /// capture when one exists (legacy 3-track), else the system mix.
+  var farEndIndex: Int? { index(of: .perApp) ?? index(of: .system) }
+
+  /// Track a single-stream consumer should read. Only present once a recording
+  /// has been rendered to the 3-track layout.
+  var mixedIndex: Int? { index(of: .mixed) }
 }
 
 nonisolated struct ExportedSegment: Codable, Sendable {
@@ -70,12 +139,14 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
   var speaker: Int
   var time: Double
   var text: String
+  var endTime: Double?
 
-  init(speaker: Int, time: Double, text: String) {
+  init(speaker: Int, time: Double, text: String, endTime: Double? = nil) {
     self.id = UUID()
     self.speaker = speaker
     self.time = time
     self.text = text
+    self.endTime = endTime
   }
 
   init(from decoder: Decoder) throws {
@@ -84,6 +155,32 @@ nonisolated struct TranscriptSegment: Codable, Identifiable, Sendable {
     self.speaker = try container.decode(Int.self, forKey: .speaker)
     self.time = try container.decode(Double.self, forKey: .time)
     self.text = try container.decode(String.self, forKey: .text)
+    self.endTime = try? container.decode(Double.self, forKey: .endTime)
+  }
+}
+
+nonisolated struct SonioxTranscriptToken: Sendable, Equatable {
+  var text: String
+  var startMilliseconds: Double
+  var endMilliseconds: Double
+  var speaker: Int
+  var language: String?
+  var translationStatus: String?
+
+  init(
+    text: String,
+    startMilliseconds: Double,
+    endMilliseconds: Double,
+    speaker: Int,
+    language: String? = nil,
+    translationStatus: String? = nil
+  ) {
+    self.text = text
+    self.startMilliseconds = startMilliseconds
+    self.endMilliseconds = endMilliseconds
+    self.speaker = speaker
+    self.language = language
+    self.translationStatus = translationStatus
   }
 }
 
@@ -120,45 +217,97 @@ final class TranscriptionService {
     self.apiKey = apiKey
   }
 
-  /// Transcribes an audio file. For dual-track recordings (system audio + mic),
-  /// tracks are mixed into a single file first so Soniox can diarize speakers
-  /// from the combined audio, producing proper speaker separation and timestamps.
+  /// Transcribes the local mic and far end separately when both are available.
   func transcribe(
     fileURL: URL,
-    onStatus: @escaping (TranscriptionStatus) -> Void
+    languageHints: [String],
+    onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
   ) async throws -> TranscriptDocument {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
+    let metadata = RecordingMetadata.load(in: fileURL.deletingLastPathComponent())
+    let trackMap = RecordingTrackMap.resolve(metadata: metadata, trackCount: tracks.count)
 
-    var uploadURL = fileURL
-    var needsCleanup = false
-
-    if tracks.count >= 2 {
+    if let micTrackIndex = trackMap.micIndex,
+      let farEndTrackIndex = trackMap.farEndIndex,
+      micTrackIndex != farEndTrackIndex,
+      tracks.indices.contains(micTrackIndex),
+      tracks.indices.contains(farEndTrackIndex)
+    {
       Log.info(
         Log.transcription, "transcription",
-        "dual-track file detected (\(tracks.count) tracks), mixing before transcription")
-      uploadURL = try await Self.mixTracks(from: fileURL)
-      needsCleanup = true
+        "separate mic and far-end tracks detected; transcribing concurrently")
+      let micUploadURL = try await Self.extractTrack(from: fileURL, at: micTrackIndex)
+      defer { try? FileManager.default.removeItem(at: micUploadURL) }
+      let farEndUploadURL = try await Self.extractTrack(from: fileURL, at: farEndTrackIndex)
+      defer { try? FileManager.default.removeItem(at: farEndUploadURL) }
+
+      async let micDocument = transcribeUploadedFile(
+        micUploadURL,
+        languageHints: languageHints,
+        enableDiarization: false,
+        onStatus: onStatus
+      )
+      async let farEndDocument = transcribeUploadedFile(
+        farEndUploadURL,
+        languageHints: languageHints,
+        enableDiarization: true,
+        onStatus: onStatus
+      )
+      var (localDocument, remoteDocument) = try await (micDocument, farEndDocument)
+      localDocument.segments = localDocument.segments.map {
+        var segment = $0
+        segment.speaker = -1
+        return segment
+      }
+      remoteDocument.segments = remoteDocument.segments.map {
+        var segment = $0
+        segment.speaker = max(0, segment.speaker)
+        return segment
+      }
+
+      let document = Self.mergeDocuments([localDocument, remoteDocument])
+      onStatus(.completed)
+      return document
     }
 
+    let uploadURL = tracks.count >= 2 ? try await Self.mixTracks(from: fileURL) : fileURL
     defer {
-      if needsCleanup {
+      if uploadURL != fileURL {
         try? FileManager.default.removeItem(at: uploadURL)
       }
     }
+    let document = try await transcribeUploadedFile(
+      uploadURL,
+      languageHints: languageHints,
+      enableDiarization: true,
+      onStatus: onStatus
+    )
+    onStatus(.completed)
+    return document
+  }
 
+  private func transcribeUploadedFile(
+    _ fileURL: URL,
+    languageHints: [String],
+    enableDiarization: Bool,
+    onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
+  ) async throws -> TranscriptDocument {
     onStatus(.uploading)
-    let fileId = try await uploadFile(uploadURL)
+    let fileId = try await uploadFile(fileURL)
     var transcriptionId: String?
 
     do {
       onStatus(.queued)
-      transcriptionId = try await createTranscription(fileId: fileId, enableDiarization: true)
+      transcriptionId = try await createTranscription(
+        fileId: fileId,
+        languageHints: languageHints,
+        enableDiarization: enableDiarization
+      )
       try await pollUntilComplete(transcriptionId: transcriptionId!, onStatus: onStatus)
-      let doc = try await fetchTranscript(transcriptionId: transcriptionId!)
-      onStatus(.completed)
+      let document = try await fetchTranscript(transcriptionId: transcriptionId!)
       fireAndForgetCleanup(transcriptionIds: [transcriptionId!], fileIds: [fileId])
-      return doc
+      return document
     } catch {
       fireAndForgetCleanup(
         transcriptionIds: [transcriptionId].compactMap { $0 }, fileIds: [fileId])
@@ -168,51 +317,41 @@ final class TranscriptionService {
 
   // MARK: - Audio Mixing & Export
 
-  /// Mixes all audio tracks into a single-track M4A for unified transcription/export.
+  /// Mixes the mic and far-end tracks into a single-track M4A for export.
   static func mixTracks(from fileURL: URL) async throws -> URL {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
     guard tracks.count >= 2 else { return fileURL }
 
-    let composition = AVMutableComposition()
+    let metadata = RecordingMetadata.load(in: fileURL.deletingLastPathComponent())
+    let trackMap = RecordingTrackMap.resolve(metadata: metadata, trackCount: tracks.count)
+    let tracksToMix: [AVAssetTrack]
+    if let micTrackIndex = trackMap.micIndex,
+      let farEndTrackIndex = trackMap.farEndIndex,
+      micTrackIndex != farEndTrackIndex,
+      tracks.indices.contains(micTrackIndex),
+      tracks.indices.contains(farEndTrackIndex)
+    {
+      tracksToMix = [tracks[micTrackIndex], tracks[farEndTrackIndex]]
+    } else {
+      tracksToMix = tracks.enumerated().compactMap { index, track in
+        trackMap.roles[index] == .mixed ? nil : track
+      }
+    }
+    guard !tracksToMix.isEmpty else {
+      throw TranscriptionError.transcriptionFailed("no audio tracks available for mixing")
+    }
+
     let duration = try await asset.load(.duration)
-
-    // For 3-track recordings (display-wide + per-app + mic), skip display-wide (track 0)
-    // to avoid doubling call audio. Use per-app + mic only.
-    let tracksToMix = tracks.count >= 3 ? Array(tracks.dropFirst()) : tracks
-
-    for sourceTrack in tracksToMix {
-      guard
-        let compositionTrack = composition.addMutableTrack(
-          withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-      else { continue }
-      try compositionTrack.insertTimeRange(
-        CMTimeRange(start: .zero, duration: duration),
-        of: sourceTrack,
-        at: .zero
-      )
-    }
-
-    let tempURL =
-      FileManager.default.temporaryDirectory
-      .appendingPathComponent("blackbox-mixed-\(UUID().uuidString).m4a")
-
-    guard
-      let exporter = AVAssetExportSession(
-        asset: composition, presetName: AVAssetExportPresetAppleM4A)
-    else {
-      throw TranscriptionError.transcriptionFailed("could not create export session for mixing")
-    }
-
-    do {
-      try await exporter.export(to: tempURL, as: .m4a)
-    } catch {
-      throw TranscriptionError.transcriptionFailed(
-        "track mixing failed: \(error.localizedDescription)")
-    }
-
-    Log.info(Log.transcription, "transcription", "mixed \(tracks.count) tracks into single file")
-    return tempURL
+    let mixedURL = try await exportTracks(
+      tracksToMix,
+      duration: duration,
+      temporaryNamePrefix: "blackbox-mixed"
+    )
+    Log.info(
+      Log.transcription, "transcription",
+      "mixed \(tracksToMix.count) tracks into single file")
+    return mixedURL
   }
 
   /// Exports a single-track M4A copy. Mixes tracks first if multi-track.
@@ -222,11 +361,75 @@ final class TranscriptionService {
 
     if tracks.count >= 2 {
       let mixed = try await mixTracks(from: fileURL)
-      defer { try? FileManager.default.removeItem(at: mixed) }
+      defer {
+        if mixed != fileURL {
+          try? FileManager.default.removeItem(at: mixed)
+        }
+      }
       try FileManager.default.copyItem(at: mixed, to: outputURL)
     } else {
       try FileManager.default.copyItem(at: fileURL, to: outputURL)
     }
+  }
+
+  private static func extractTrack(from fileURL: URL, at index: Int) async throws -> URL {
+    let asset = AVURLAsset(url: fileURL)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    guard tracks.indices.contains(index) else {
+      throw TranscriptionError.transcriptionFailed("audio track \(index) is unavailable")
+    }
+    let duration = try await asset.load(.duration)
+    return try await exportTracks(
+      [tracks[index]],
+      duration: duration,
+      temporaryNamePrefix: "blackbox-track"
+    )
+  }
+
+  private static func exportTracks(
+    _ sourceTracks: [AVAssetTrack],
+    duration: CMTime,
+    temporaryNamePrefix: String
+  ) async throws -> URL {
+    let composition = AVMutableComposition()
+    for sourceTrack in sourceTracks {
+      guard
+        let compositionTrack = composition.addMutableTrack(
+          withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+      else {
+        throw TranscriptionError.transcriptionFailed("could not create composition audio track")
+      }
+      try compositionTrack.insertTimeRange(
+        CMTimeRange(start: .zero, duration: duration),
+        of: sourceTrack,
+        at: .zero
+      )
+    }
+
+    let tempURL =
+      FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(temporaryNamePrefix)-\(UUID().uuidString).m4a")
+    var didExport = false
+    defer {
+      if !didExport {
+        try? FileManager.default.removeItem(at: tempURL)
+      }
+    }
+    guard
+      let exporter = AVAssetExportSession(
+        asset: composition, presetName: AVAssetExportPresetAppleM4A)
+    else {
+      throw TranscriptionError.transcriptionFailed("could not create export session")
+    }
+
+    do {
+      try await exporter.export(to: tempURL, as: .m4a)
+    } catch {
+      throw TranscriptionError.transcriptionFailed(
+        "audio export failed: \(error.localizedDescription)")
+    }
+    didExport = true
+    return tempURL
   }
 
   // MARK: - Upload
@@ -293,19 +496,18 @@ final class TranscriptionService {
     return fileId
   }
 
-  // MARK: - Create Transcription
-
   private func createTranscription(
-    fileId: String, enableDiarization: Bool
+    fileId: String,
+    languageHints: [String],
+    enableDiarization: Bool
   ) async throws -> String {
-    var config: [String: Any] = [
+    let config: [String: Any] = [
       "model": "stt-async-v5",
       "file_id": fileId,
+      "language_hints": languageHints,
+      "enable_speaker_diarization": enableDiarization,
       "enable_language_identification": true,
     ]
-    if enableDiarization {
-      config["enable_speaker_diarization"] = true
-    }
 
     var request = try makeRequest(.post, "/v1/transcriptions")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -327,13 +529,14 @@ final class TranscriptionService {
 
   private func pollUntilComplete(
     transcriptionId: String,
-    onStatus: @escaping (TranscriptionStatus) -> Void
+    onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
   ) async throws {
     var didReportTranscribing = false
 
-    for _ in 0..<900 {  // 900 * 2s = 30 minutes max
+    // First minute at 2s, then 5s: 1,458 polls span two hours.
+    for attempt in 0..<1_458 {
       try Task.checkCancellation()
-      try await Task.sleep(for: .seconds(2))
+      try await Task.sleep(for: attempt < 30 ? .seconds(2) : .seconds(5))
 
       let request = try makeRequest(.get, "/v1/transcriptions/\(transcriptionId)")
       let data: Data
@@ -355,15 +558,20 @@ final class TranscriptionService {
       let status = json?["status"] as? String
 
       switch status {
+      case "queued":
+        onStatus(.queued)
+      case "processing" where !didReportTranscribing:
+        didReportTranscribing = true
+        onStatus(.transcribing)
       case "completed":
         Log.info(Log.transcription, "transcription", "completed: \(transcriptionId)")
         return
       case "error":
-        let msg = json?["error_message"] as? String ?? "unknown error"
-        throw TranscriptionError.transcriptionFailed(msg)
-      case "transcribing" where !didReportTranscribing:
-        didReportTranscribing = true
-        onStatus(.transcribing)
+        let message =
+          json?["error_message"] as? String
+          ?? json?["error_type"] as? String
+          ?? "unknown error"
+        throw TranscriptionError.transcriptionFailed(message)
       default:
         break
       }
@@ -382,72 +590,174 @@ final class TranscriptionService {
     try checkHTTPResponse(response, data: data, context: "fetch transcript")
 
     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let tokens = json["tokens"] as? [[String: Any]], !tokens.isEmpty
+      let rawTokens = json["tokens"] as? [[String: Any]], !rawTokens.isEmpty
     else {
       throw TranscriptionError.transcriptionFailed("empty or invalid transcript response")
     }
 
-    return groupTokensIntoDocument(tokens)
+    return Self.groupTokensIntoDocument(Self.tokens(from: rawTokens))
   }
 
-  private func groupTokensIntoDocument(_ tokens: [[String: Any]]) -> TranscriptDocument {
+  // MARK: - Transcript Grouping
+
+  nonisolated static func languageHints(from value: String) -> [String] {
+    let hints =
+      value
+      .split(separator: ",")
+      .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    return hints.isEmpty ? ["ru"] : hints
+  }
+
+  nonisolated static func groupTokensIntoDocument(
+    _ tokens: [SonioxTranscriptToken]
+  ) -> TranscriptDocument {
+    let transcriptTokens = tokens.filter { $0.translationStatus != "translation" }
     var segments: [TranscriptSegment] = []
     var currentSpeaker: Int?
     var currentText = ""
-    var currentTime: Double = 0
+    var currentStart = 0.0
+    var currentEnd = 0.0
+    var previousToken: SonioxTranscriptToken?
 
-    for token in tokens {
-      // Skip translation tokens
-      if token["translation_status"] as? String == "translation" { continue }
-
-      // Soniox v4+ returns speaker as String ("1", "2"), v3 returned Int
-      let speaker: Int
-      if let s = token["speaker"] as? Int {
-        speaker = s
-      } else if let s = token["speaker"] as? String, let i = Int(s) {
-        speaker = i
-      } else {
-        speaker = 0
-      }
-      let text = token["text"] as? String ?? ""
-
-      if speaker != currentSpeaker {
-        if let s = currentSpeaker,
-          !currentText.trimmingCharacters(in: .whitespaces)
-            .isEmpty
-        {
-          segments.append(
-            TranscriptSegment(
-              speaker: s,
-              time: currentTime,
-              text: currentText.trimmingCharacters(in: .whitespaces)))
-        }
-        currentSpeaker = speaker
-        currentText = ""
-        currentTime = (token["start_ms"] as? Double ?? 0) / 1000.0
-      }
-      currentText += text
-    }
-
-    // Last segment
-    if let s = currentSpeaker,
-      !currentText.trimmingCharacters(in: .whitespaces).isEmpty
-    {
+    func appendCurrentSegment() {
+      guard let currentSpeaker else { return }
+      let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { return }
       segments.append(
         TranscriptSegment(
-          speaker: s,
-          time: currentTime,
-          text: currentText.trimmingCharacters(in: .whitespaces)))
+          speaker: currentSpeaker,
+          time: currentStart,
+          text: text,
+          endTime: currentEnd
+        )
+      )
     }
 
-    let language =
-      tokens.first(where: {
-        $0["language"] as? String != nil
-          && $0["translation_status"] as? String != "translation"
-      })?["language"] as? String
+    for token in transcriptTokens {
+      let start = token.startMilliseconds / 1_000
+      let end = token.endMilliseconds / 1_000
+      let shouldStartNewSegment: Bool
+      if let currentSpeaker, let previousToken {
+        let previousEnd = previousToken.endMilliseconds / 1_000
+        let speakerChanged = token.speaker != currentSpeaker
+        let hasGap = start - previousEnd > 0.8
+        let shouldBreakLongSentence =
+          Self.endsSentence(previousToken.text)
+          && previousEnd - currentStart > 12
+        shouldStartNewSegment = speakerChanged || hasGap || shouldBreakLongSentence
+      } else {
+        shouldStartNewSegment = true
+      }
 
+      if shouldStartNewSegment {
+        appendCurrentSegment()
+        currentSpeaker = token.speaker
+        currentText = ""
+        currentStart = start
+      }
+      currentText += token.text
+      currentEnd = end
+      previousToken = token
+    }
+    appendCurrentSegment()
+
+    let language = transcriptTokens.first(where: { $0.language != nil })?.language
+    return TranscriptDocument(segments: segments, language: language, createdAt: Date())
+  }
+
+  nonisolated static func mergeDocuments(
+    _ documents: [TranscriptDocument]
+  ) -> TranscriptDocument {
+    let indexedSegments = documents.flatMap(\.segments).enumerated().map {
+      (index: $0.offset, segment: $0.element)
+    }
+    let segments = indexedSegments.sorted {
+      $0.segment.time == $1.segment.time
+        ? $0.index < $1.index
+        : $0.segment.time < $1.segment.time
+    }
+    let language = documents.compactMap(\.language).first
+    let createdAt = documents.map(\.createdAt).min() ?? Date()
     return TranscriptDocument(
-      segments: segments, language: language, createdAt: Date())
+      segments: segments.map { $0.segment },
+      language: language,
+      createdAt: createdAt
+    )
+  }
+
+  nonisolated private static func endsSentence(_ text: String) -> Bool {
+    guard let finalCharacter = text.trimmingCharacters(in: .whitespacesAndNewlines).last else {
+      return false
+    }
+    return ".!?…".contains(finalCharacter)
+  }
+
+  private static func tokens(from rawTokens: [[String: Any]]) -> [SonioxTranscriptToken] {
+    let reservedSpeakerIDs = Set(
+      rawTokens
+        .compactMap { rawSpeakerIdentifier(in: $0) }
+        .compactMap(Int.init)
+        .filter { $0 >= 0 }
+    )
+    var opaqueSpeakerIDs: [String: Int] = [:]
+    var nextSpeakerID = 0
+
+    func speakerID(for rawToken: [String: Any]) -> Int {
+      guard let identifier = rawSpeakerIdentifier(in: rawToken) else { return 0 }
+      if let numericID = Int(identifier), numericID >= 0 {
+        return numericID
+      }
+      if let existingID = opaqueSpeakerIDs[identifier] {
+        return existingID
+      }
+      while reservedSpeakerIDs.contains(nextSpeakerID) {
+        nextSpeakerID += 1
+      }
+      let assignedID = nextSpeakerID
+      opaqueSpeakerIDs[identifier] = assignedID
+      nextSpeakerID += 1
+      return assignedID
+    }
+
+    return rawTokens.map { rawToken in
+      token(from: rawToken, speaker: speakerID(for: rawToken))
+    }
+  }
+
+  private static func rawSpeakerIdentifier(in rawToken: [String: Any]) -> String? {
+    if let value = rawToken["speaker"] as? String, !value.isEmpty {
+      return value
+    }
+    if let value = rawToken["speaker"] as? Int {
+      return String(value)
+    }
+    if let value = rawToken["speaker"] as? NSNumber {
+      return String(value.intValue)
+    }
+    return nil
+  }
+
+  private static func token(
+    from rawToken: [String: Any],
+    speaker: Int
+  ) -> SonioxTranscriptToken {
+    SonioxTranscriptToken(
+      text: rawToken["text"] as? String ?? "",
+      startMilliseconds: numericValue(rawToken["start_ms"]),
+      endMilliseconds: numericValue(rawToken["end_ms"]),
+      speaker: speaker,
+      language: rawToken["language"] as? String,
+      translationStatus: rawToken["translation_status"] as? String
+    )
+  }
+
+  private static func numericValue(_ value: Any?) -> Double {
+    if let value = value as? Double { return value }
+    if let value = value as? Int { return Double(value) }
+    if let value = value as? NSNumber { return value.doubleValue }
+    if let value = value as? String, let parsed = Double(value) { return parsed }
+    return 0
   }
 
   // MARK: - Cleanup
@@ -506,16 +816,21 @@ final class TranscriptionService {
       Log.error(
         Log.transcription, "transcription",
         "\(context) failed (\(http.statusCode)): \(body)")
-      let apiMsg: String
-      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-        let msg = json["error"] as? String ?? json["message"] as? String
-      {
-        apiMsg = msg
+
+      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      let validationMessages =
+        (json?["validation_errors"] as? [[String: Any]])?
+        .compactMap { $0["message"] as? String }
+        .filter { !$0.isEmpty } ?? []
+      let message = json?["message"] as? String ?? json?["error"] as? String
+      let apiMessage: String
+      if !validationMessages.isEmpty {
+        apiMessage = ([message].compactMap { $0 } + validationMessages)
+          .joined(separator: ": ")
       } else {
-        apiMsg = "HTTP \(http.statusCode)"
+        apiMessage = message ?? "HTTP \(http.statusCode)"
       }
-      throw TranscriptionError.transcriptionFailed(
-        "\(context): \(apiMsg)")
+      throw TranscriptionError.transcriptionFailed("\(context): \(apiMessage)")
     }
   }
 }

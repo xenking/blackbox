@@ -18,8 +18,11 @@ struct SettingsView: View {
   @AppStorage("notifyOnError") private var notifyOnError = true
   @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
   @AppStorage("excludedTitlePatterns") private var excludedTitlePatternsRaw = ""
+  @AppStorage("transcriptionLanguages") private var transcriptionLanguages =
+    defaultTranscriptionLanguages
   @State private var newTitlePattern = ""
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+  @State private var apiKeySaveTask: Task<Void, Never>?
 
   @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
@@ -44,7 +47,12 @@ struct SettingsView: View {
       migrateAPIKeyToKeychain()
     }
     .onChange(of: sonioxAPIKey) { _, newValue in
-      KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
+      apiKeySaveTask?.cancel()
+      apiKeySaveTask = Task {
+        try? await Task.sleep(for: .milliseconds(500))
+        guard !Task.isCancelled else { return }
+        KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
+      }
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -347,6 +355,13 @@ struct SettingsView: View {
   private var transcriptionSection: some View {
     Section("Transcription") {
       SecureField("Soniox API Key", text: $sonioxAPIKey)
+      TextField("Languages", text: $transcriptionLanguages)
+        .help("Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en.")
+      Text(
+        "Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
       Text(
         "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
       )
@@ -462,10 +477,16 @@ struct SettingsView: View {
 
 // MARK: - Keychain Helper
 
+@MainActor
 enum KeychainHelper {
   private static let service = "com.tenequm.Blackbox"
+  private static var cachedValues: [String: String] = [:]
+  private static var missingKeys: Set<String> = []
 
   static func string(forKey key: String) -> String? {
+    if let value = cachedValues[key] { return value }
+    if missingKeys.contains(key) { return nil }
+
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -474,12 +495,25 @@ enum KeychainHelper {
     ]
     var result: AnyObject?
     guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-      let data = result as? Data
-    else { return nil }
-    return String(data: data, encoding: .utf8)
+      let data = result as? Data,
+      let value = String(data: data, encoding: .utf8)
+    else {
+      missingKeys.insert(key)
+      return nil
+    }
+    cachedValues[key] = value
+    return value
   }
 
   static func setString(_ value: String, forKey key: String) {
+    if value.isEmpty {
+      cachedValues.removeValue(forKey: key)
+      missingKeys.insert(key)
+    } else {
+      cachedValues[key] = value
+      missingKeys.remove(key)
+    }
+
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -494,5 +528,6 @@ enum KeychainHelper {
   }
 }
 
+let defaultTranscriptionLanguages = "ru"
 let defaultSaveDirectoryPath =
   NSHomeDirectory() + "/Library/Application Support/Blackbox/Recordings"

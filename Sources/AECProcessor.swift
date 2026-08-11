@@ -3,10 +3,9 @@ import CoreMedia
 import DTLNAec256
 import DTLNAecCoreML
 
-/// Post-processes recorded audio to remove echo from the mic track using DTLN-aec.
-/// Reads dual-track `audio.m4a`, runs echo cancellation on the mic track using
-/// system audio as the far-end reference, writes `audio-processed.m4a` with both
-/// tracks at 16kHz mono AAC. Original file is preserved for fallback.
+/// Post-processes a recording's mic track using its far-end track as the
+/// DTLN-aec reference, then writes `audio-processed.m4a` with both tracks at
+/// 16kHz mono AAC. Original file is preserved for fallback.
 enum AECProcessor {
 
   /// Process a recording directory. No-op if already processed or single-track.
@@ -44,16 +43,18 @@ enum AECProcessor {
       return
     }
 
-    // Track layout:
-    // 2-track (current): [0]=system audio, [1]=mic
-    // 3-track (legacy, pre-v0.7.0): [0]=display-wide, [1]=per-app, [2]=mic
-    let micTrack = tracks[tracks.count - 1]
-    let referenceTrack: AVAssetTrack
-    if tracks.count >= 3 {
-      referenceTrack = tracks[1]
-      Log.info(Log.recorder, "aec", "using per-app track as AEC reference (3-track)")
-    } else {
-      referenceTrack = tracks[0]
+    let map = RecordingTrackMap.resolve(
+      metadata: RecordingMetadata.load(in: inputURL.deletingLastPathComponent()),
+      trackCount: tracks.count
+    )
+    guard let micIndex = map.micIndex, let referenceIndex = map.farEndIndex else {
+      Log.info(Log.recorder, "aec", "recording has no mic/far-end pair, skipping")
+      return
+    }
+    let micTrack = tracks[micIndex]
+    let referenceTrack = tracks[referenceIndex]
+    if map.roles[referenceIndex] == .perApp {
+      Log.info(Log.recorder, "aec", "using per-app track as AEC reference")
     }
 
     let pcmSettings: [String: Any] = [
@@ -85,7 +86,9 @@ enum AECProcessor {
       throw AECError.readFailed(micReader.error?.localizedDescription ?? "mic track")
     }
 
-    // Writer with two AAC inputs
+    // `audio-processed.m4a` is metadata-independent: its fixed two-track order
+    // is [system/far-end reference, cleaned mic], matching RecordingTrackMap's
+    // documented 2-track fallback of [.system, .mic].
     let aacSettings: [String: Any] = [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
       AVSampleRateKey: sampleRate,

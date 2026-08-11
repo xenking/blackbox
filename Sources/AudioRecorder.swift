@@ -7,8 +7,9 @@ import ObjCExceptionCatcher
 /// Records system audio via ScreenCaptureKit (SCStream, display-wide) and mic via
 /// AVAudioEngine as independent pipelines.
 ///
-/// Dual-track capture: system audio (SCStream) and mic (AVAudioEngine) written as
-/// separate AVAssetWriterInputs to a single M4A file. No post-processing or mixing.
+/// Live capture writes system audio and mic as separate AVAssetWriterInputs so
+/// capture never depends on post-processing. TrackMixdown later rewrites a
+/// completed mic recording to `[mixed, mic, system]`.
 /// Uses a custom DispatchSerialQueue executor - all actor-isolated state is
 /// accessed on `audioQueue`.
 ///

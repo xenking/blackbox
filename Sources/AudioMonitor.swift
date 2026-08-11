@@ -121,12 +121,16 @@ final class AudioMonitor {
     let manualTask = manualStartTask
 
     if let recorder = autoRecorder {
-      _ = await recorder.stop()
+      if let url = await recorder.stop() {
+        scheduleTrackMixdown(for: url)
+      }
       autoRecorder = nil
     }
 
     if let recorder = manualRecorder {
-      _ = await recorder.stop()
+      if let url = await recorder.stop() {
+        scheduleTrackMixdown(for: url)
+      }
       manualRecorder = nil
       isManualRecording = false
     }
@@ -139,6 +143,12 @@ final class AudioMonitor {
     isRecording = false
     currentAppName = nil
     recordingStartTime = nil
+  }
+
+  private func scheduleTrackMixdown(for recordingDirectory: URL) {
+    Task {
+      await TrackMixdown.render(recordingDirectory: recordingDirectory)
+    }
   }
 
   // MARK: - Error
@@ -277,7 +287,9 @@ final class AudioMonitor {
     savingCount += 1
     isSaving = true
     Task {
-      _ = await failedRecorder.stop()
+      if let url = await failedRecorder.stop() {
+        scheduleTrackMixdown(for: url)
+      }
       savingCount -= 1
       isSaving = savingCount > 0
     }
@@ -321,9 +333,8 @@ final class AudioMonitor {
     isSaving = true
     Task {
       let url = await recorder.stop()
-      savingCount -= 1
-      isSaving = savingCount > 0
-      if url != nil {
+      if let url {
+        scheduleTrackMixdown(for: url)
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
@@ -678,9 +689,8 @@ final class AudioMonitor {
     isSaving = true
     Task {
       let url = await recorder.stop()
-      savingCount -= 1
-      isSaving = savingCount > 0
-      if url != nil {
+      if let url {
+        scheduleTrackMixdown(for: url)
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
@@ -700,7 +710,9 @@ final class AudioMonitor {
     savingCount += 1
     isSaving = true
     Task {
-      _ = await failedRecorder.stop()
+      if let url = await failedRecorder.stop() {
+        scheduleTrackMixdown(for: url)
+      }
       savingCount -= 1
       isSaving = savingCount > 0
     }

@@ -323,6 +323,8 @@ struct RecordingDetailView: View {
   var onTitleChanged: () -> Void
 
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
+  @AppStorage("transcriptionLanguages") private var transcriptionLanguages =
+    defaultTranscriptionLanguages
 
   // Playback
   @State private var player: AVPlayer?
@@ -518,7 +520,7 @@ struct RecordingDetailView: View {
           }
         }
         .pickerStyle(.segmented)
-        .frame(width: (metadata?.trackCount ?? 2) >= 3 ? 240 : 180)
+        .frame(width: CGFloat(availableTrackSelections.count) * 60)
         .onChange(of: trackSelection) { _, newValue in
           applyTrackSelection(newValue)
         }
@@ -660,26 +662,35 @@ struct RecordingDetailView: View {
   }
 
   private var availableTrackSelections: [TrackSelection] {
-    let count = metadata?.trackCount ?? 2
-    if count >= 3 {
-      return [.all, .system, .perApp, .mic]
-    } else {
-      return [.all, .system, .mic]
+    let audioTracks =
+      player?.currentItem?.tracks.filter {
+        $0.assetTrack?.mediaType == .audio
+      } ?? []
+    let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: audioTracks.count)
+    var selections: [TrackSelection] = [.all]
+    for role in map.roles {
+      let selection = TrackSelection(role: role)
+      if !selections.contains(selection) {
+        selections.append(selection)
+      }
     }
+    return selections
   }
 
   private func applyTrackSelection(_ selection: TrackSelection) {
     guard let tracks = player?.currentItem?.tracks else { return }
     let audioTracks = tracks.filter { $0.assetTrack?.mediaType == .audio }
-    let trackCount = audioTracks.count
-    for (i, track) in audioTracks.enumerated() {
-      let isLast = (i == trackCount - 1)
-      switch selection {
-      case .all: track.isEnabled = true
-      case .system: track.isEnabled = (i == 0)
-      case .perApp: track.isEnabled = (trackCount >= 3 && i == 1)
-      case .mic: track.isEnabled = isLast
-      }
+    let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: audioTracks.count)
+    let selectedRole: RecordingTrackRole?
+    switch selection {
+    case .all: selectedRole = nil
+    case .mixed: selectedRole = .mixed
+    case .system: selectedRole = .system
+    case .perApp: selectedRole = .perApp
+    case .mic: selectedRole = .mic
+    }
+    for (index, track) in audioTracks.enumerated() {
+      track.isEnabled = selectedRole.map { map.index(of: $0) == index } ?? true
     }
   }
 
@@ -725,7 +736,7 @@ struct RecordingDetailView: View {
     if let name = metadata?.speakers[String(speakerID)], !name.isEmpty {
       return name
     }
-    return speakerID == -1 ? "You" : "Speaker \(speakerID + 1)"
+    return speakerID == -1 ? "Я" : "Speaker \(speakerID + 1)"
   }
 
   private func saveSpeakerName(_ name: String, for speakerID: Int) {
@@ -854,6 +865,7 @@ struct RecordingDetailView: View {
       do {
         let doc = try await service.transcribe(
           fileURL: recording.audioURL,
+          languageHints: TranscriptionService.languageHints(from: transcriptionLanguages),
           onStatus: { status in
             transcriptionStatus = status
           }
@@ -1029,11 +1041,23 @@ private struct TranscriptSegmentView: View {
 // MARK: - Track Selection
 
 enum TrackSelection: String, Identifiable {
-  case all, system, perApp, mic
+  case all, mixed, system, perApp, mic
+
+  init(role: RecordingTrackRole) {
+    switch role {
+    case .mixed: self = .mixed
+    case .mic: self = .mic
+    case .system: self = .system
+    case .perApp: self = .perApp
+    }
+  }
+
   var id: String { rawValue }
+
   var label: String {
     switch self {
     case .all: "All"
+    case .mixed: "Mix"
     case .system: "System"
     case .perApp: "App"
     case .mic: "Mic"

@@ -208,7 +208,8 @@ final class RecordingPipeline: @unchecked Sendable {
         speakers: [:],
         perAppBundleID: bundleID,
         perAppName: nil,
-        trackCount: 1 + (micEnabled ? 1 : 0)
+        trackCount: 1 + (micEnabled ? 1 : 0),
+        tracks: micEnabled ? [.system, .mic] : [.system]
       )
       try metadata.save(in: dirURL)
 
