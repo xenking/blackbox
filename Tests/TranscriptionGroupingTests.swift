@@ -87,4 +87,32 @@ struct TranscriptionGroupingTests {
     #expect(TranscriptionService.languageHints(from: " ru , en ") == ["ru", "en"])
     #expect(TranscriptionService.languageHints(from: "") == ["ru"])
   }
+
+  @Test("separate tracks keep the local mic out of desktop diarization")
+  func separateTrackRequestContract() {
+    let metadata = RecordingMetadata(
+      title: "Current three-track recording",
+      createdAt: .now,
+      appName: "Tests",
+      speakers: [:],
+      trackCount: 3,
+      tracks: [.mixed, .mic, .system]
+    )
+    let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: 3)
+    let jobs = TranscriptionService.planJobs(
+      separateTracks: true, map: map, trackCount: 3)
+
+    #expect(jobs.map(\.role) == [.mic, .farEnd])
+    #expect(jobs.map(\.trackIndex) == [1, 2])
+    #expect(jobs.map(\.diarization) == [false, true])
+
+    let mic = TranscriptionService.transcriptionConfiguration(
+      fileId: "mic", languageHints: ["ru"], enableDiarization: jobs[0].diarization)
+    let desktop = TranscriptionService.transcriptionConfiguration(
+      fileId: "desktop", languageHints: ["ru"], enableDiarization: jobs[1].diarization)
+    #expect(mic["enable_speaker_diarization"] as? Bool == false)
+    #expect(desktop["enable_speaker_diarization"] as? Bool == true)
+    #expect(mic["context"] == nil)
+    #expect(desktop["context"] == nil)
+  }
 }

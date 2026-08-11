@@ -422,7 +422,7 @@ final class TranscriptionService {
 
   /// One Soniox job: which side of the call it covers, which track feeds it, and
   /// whether that side needs speaker splitting.
-  private struct PlannedJob: Sendable {
+  struct PlannedJob: Sendable {
     let role: TranscriptionJobRole
     /// Track to upload. `nil` means "no single track carries this" - the upload is
     /// mixed on the fly instead.
@@ -430,7 +430,7 @@ final class TranscriptionService {
     let diarization: Bool
   }
 
-  private static func planJobs(
+  static func planJobs(
     separateTracks: Bool, map: RecordingTrackMap, trackCount: Int
   ) -> [PlannedJob] {
     if separateTracks, let mic = map.micIndex, let farEnd = map.farEndIndex, mic != farEnd,
@@ -758,13 +758,11 @@ final class TranscriptionService {
     languageHints: [String],
     enableDiarization: Bool
   ) async throws -> String {
-    let config: [String: Any] = [
-      "model": "stt-async-v5",
-      "file_id": fileId,
-      "language_hints": languageHints,
-      "enable_speaker_diarization": enableDiarization,
-      "enable_language_identification": true,
-    ]
+    let config = Self.transcriptionConfiguration(
+      fileId: fileId,
+      languageHints: languageHints,
+      enableDiarization: enableDiarization
+    )
 
     var request = try makeRequest(.post, "/v1/transcriptions")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -780,6 +778,24 @@ final class TranscriptionService {
     Log.info(
       Log.transcription, "transcription", "created transcription: \(transcriptionId)")
     return transcriptionId
+  }
+
+  /// A transcription request deliberately carries no inferred context. Context
+  /// is an accuracy bias, not a source of truth: Blackbox has no pre-recording
+  /// agenda or participant data, and must not bias the desktop-only job toward
+  /// the local speaker from a transcript it does not yet have.
+  static func transcriptionConfiguration(
+    fileId: String,
+    languageHints: [String],
+    enableDiarization: Bool
+  ) -> [String: Any] {
+    [
+      "model": "stt-async-v5",
+      "file_id": fileId,
+      "language_hints": languageHints,
+      "enable_speaker_diarization": enableDiarization,
+      "enable_language_identification": true,
+    ]
   }
 
   // MARK: - Poll
