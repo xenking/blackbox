@@ -7,6 +7,69 @@ enum MainTab: Hashable {
   case settings
 }
 
+@Observable
+final class TranscriptionCoordinator {
+  private var transcripts: [String: TranscriptDocument] = [:]
+  private var statuses: [String: TranscriptionStatus] = [:]
+  @ObservationIgnored private var tasks: [String: Task<Void, Never>] = [:]
+
+  func transcript(for recording: RecordingFile) -> TranscriptDocument? {
+    transcripts[recording.id]
+  }
+
+  func status(for recording: RecordingFile) -> TranscriptionStatus {
+    statuses[recording.id] ?? .idle
+  }
+
+  func load(recording: RecordingFile) {
+    guard transcripts[recording.id] == nil, tasks[recording.id] == nil else { return }
+    transcripts[recording.id] = TranscriptDocument.load(for: recording.url)
+  }
+
+  func start(
+    recording: RecordingFile,
+    apiKey: String,
+    languageHints: [String],
+    separateTracks: Bool
+  ) {
+    guard tasks[recording.id] == nil, !apiKey.isEmpty else { return }
+    statuses[recording.id] = .uploading
+    tasks[recording.id] = Task { [weak self] in
+      guard let self else { return }
+      defer { self.tasks[recording.id] = nil }
+      do {
+        let document = try await TranscriptionService(apiKey: apiKey).transcribe(
+          fileURL: recording.audioURL,
+          languageHints: languageHints,
+          separateTracks: separateTracks,
+          onStatus: { [weak self] status in
+            self?.statuses[recording.id] = status
+          }
+        )
+        self.transcripts[recording.id] = document
+        self.statuses[recording.id] = .completed
+      } catch is CancellationError {
+        self.statuses[recording.id] = .idle
+      } catch let error as URLError where error.code == .cancelled {
+        self.statuses[recording.id] =
+          Task.isCancelled ? .idle : .error(error.localizedDescription)
+      } catch {
+        self.statuses[recording.id] =
+          Task.isCancelled ? .idle : .error(error.localizedDescription)
+        if !Task.isCancelled {
+          Log.error(Log.transcription, "transcription", "failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  /// Stops local polling. Any created Soniox job remains in the per-recording
+  /// ledger and a later Transcribe resumes it without creating another job.
+  func stopWaiting(for recording: RecordingFile) {
+    tasks[recording.id]?.cancel()
+  }
+}
+
 struct MainWindowView: View {
   @Binding var selectedTab: MainTab
 
@@ -26,6 +89,7 @@ struct MainWindowView: View {
 // MARK: - Recordings
 
 struct RecordingsView: View {
+  @State private var transcriptionCoordinator = TranscriptionCoordinator()
   @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
   @State private var recordings: [RecordingFile] = []
   @State private var selectedRecordingID: String?
@@ -41,11 +105,11 @@ struct RecordingsView: View {
       {
         RecordingDetailView(
           recording: recording,
+          transcriptionCoordinator: transcriptionCoordinator,
           onDelete: { deleteRecordings(Set([id])) },
           onTranscriptChanged: { Task { await loadRecordings() } },
           onTitleChanged: { Task { await loadRecordings() } }
         )
-        .id(id)
       } else {
         ContentUnavailableView(
           "Select a Recording",
@@ -318,6 +382,7 @@ private struct RecordingRow: View {
 
 struct RecordingDetailView: View {
   let recording: RecordingFile
+  let transcriptionCoordinator: TranscriptionCoordinator
   var onDelete: () -> Void
   var onTranscriptChanged: () -> Void
   var onTitleChanged: () -> Void
@@ -325,6 +390,7 @@ struct RecordingDetailView: View {
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
   @AppStorage("transcriptionLanguages") private var transcriptionLanguages =
     defaultTranscriptionLanguages
+  @AppStorage("transcribeSeparateTracks") private var transcribeSeparateTracks = true
 
   // Playback
   @State private var player: AVPlayer?
@@ -347,10 +413,13 @@ struct RecordingDetailView: View {
   @State private var isEditingTitle = false
   @State private var editedTitle = ""
 
-  // Transcription
-  @State private var transcript: TranscriptDocument?
-  @State private var transcriptionStatus: TranscriptionStatus = .idle
-  @State private var transcriptionTask: Task<Void, Never>?
+  private var transcript: TranscriptDocument? {
+    transcriptionCoordinator.transcript(for: recording)
+  }
+
+  private var transcriptionStatus: TranscriptionStatus {
+    transcriptionCoordinator.status(for: recording)
+  }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -380,7 +449,6 @@ struct RecordingDetailView: View {
     }
     .onDisappear {
       teardownPlayer()
-      cancelTranscription()
     }
     .focusable()
     .onKeyPress(.space) {
@@ -778,7 +846,7 @@ struct RecordingDetailView: View {
           Text(transcriptionStatusText)
             .font(.caption)
             .foregroundStyle(.secondary)
-          Button("Cancel") { cancelTranscription() }
+          Button("Stop waiting") { cancelTranscription() }
             .buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -849,65 +917,21 @@ struct RecordingDetailView: View {
   }
 
   // MARK: - Transcription Lifecycle
-
   private func loadTranscript() {
-    transcript = TranscriptDocument.load(for: recording.url)
-    transcriptionStatus = .idle
+    transcriptionCoordinator.load(recording: recording)
   }
 
   private func startTranscription() {
-    guard !sonioxAPIKey.isEmpty else { return }
-
-    transcriptionTask = Task {
-      let service = TranscriptionService(apiKey: sonioxAPIKey)
-      transcriptionStatus = .uploading
-
-      do {
-        let doc = try await service.transcribe(
-          fileURL: recording.audioURL,
-          languageHints: TranscriptionService.languageHints(from: transcriptionLanguages),
-          onStatus: { status in
-            transcriptionStatus = status
-          }
-        )
-        // Show transcript immediately, then persist
-        transcript = doc
-        transcriptionStatus = .completed
-        onTranscriptChanged()
-        do {
-          try doc.save(for: recording.url)
-        } catch {
-          Log.error(
-            Log.transcription, "transcription",
-            "failed to save transcript: \(error.localizedDescription)")
-        }
-      } catch is CancellationError {
-        transcriptionStatus = .idle
-      } catch let error as URLError where error.code == .cancelled {
-        // URLSession throws URLError.cancelled when Task is cancelled
-        if Task.isCancelled {
-          transcriptionStatus = .idle
-        } else {
-          transcriptionStatus = .error(error.localizedDescription)
-        }
-      } catch {
-        if Task.isCancelled {
-          transcriptionStatus = .idle
-        } else {
-          transcriptionStatus = .error(error.localizedDescription)
-          Log.error(
-            Log.transcription, "transcription",
-            "failed: \(error.localizedDescription)")
-        }
-      }
-    }
+    transcriptionCoordinator.start(
+      recording: recording,
+      apiKey: sonioxAPIKey,
+      languageHints: TranscriptionService.languageHints(from: transcriptionLanguages),
+      separateTracks: transcribeSeparateTracks
+    )
   }
 
   private func cancelTranscription() {
-    transcriptionTask?.cancel()
-    transcriptionTask = nil
-    if case .error = transcriptionStatus { return }
-    transcriptionStatus = .idle
+    transcriptionCoordinator.stopWaiting(for: recording)
   }
 
   // MARK: - Transcript Export

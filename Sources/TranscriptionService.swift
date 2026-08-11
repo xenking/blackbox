@@ -197,13 +197,143 @@ nonisolated enum TranscriptionError: Error, LocalizedError, Sendable {
   case uploadFailed(String)
   case transcriptionFailed(String)
   case pollTimeout
+  /// Soniox reported terminal `status: error` for a job. Distinct from
+  /// `transcriptionFailed` (which also covers transient HTTP failures) because
+  /// only this one means the job produced nothing and its id is worthless.
+  case jobFailed(String)
 
   var errorDescription: String? {
     switch self {
     case .uploadFailed(let msg): "Upload failed: \(msg)"
     case .transcriptionFailed(let msg): "Transcription failed: \(msg)"
     case .pollTimeout: "Transcription timed out"
+    case .jobFailed(let msg): "Transcription failed: \(msg)"
     }
+  }
+}
+
+// MARK: - Paid Job Ledger
+
+/// Which side of the call a Soniox job covers.
+nonisolated enum TranscriptionJobRole: String, Codable, Sendable {
+  case mic
+  case farEnd
+  /// One job over the whole recording (mixed track, or a file with nothing to split).
+  case single
+}
+
+/// The Soniox jobs a recording has already been billed for.
+///
+/// The async API bills input audio when a transcription is *created*, not when
+/// its transcript is fetched, so a job id is money already spent. Persisting it
+/// next to the recording is what makes a paid job survive switching recordings,
+/// quitting the app, or a crash: the next attempt resumes that id instead of
+/// uploading and paying again. Nothing here may be deleted remotely until its
+/// transcript has actually been fetched.
+nonisolated struct TranscriptionJobLedger: Codable, Sendable {
+  nonisolated struct Job: Codable, Sendable {
+    var role: TranscriptionJobRole
+    /// Uploaded file. Storage only - uploading is not what gets billed.
+    var fileId: String?
+    /// Created transcription. Once set, this recording has been charged.
+    var transcriptionId: String?
+  }
+
+  var jobs: [Job]
+  var languageHints: [String]
+  var separateTracks: Bool
+  var createdAt: Date
+
+  static let fileName = "transcription-job.json"
+
+  static func load(in directory: URL) -> TranscriptionJobLedger? {
+    let url = directory.appendingPathComponent(fileName)
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(TranscriptionJobLedger.self, from: data)
+  }
+
+  func save(in directory: URL) throws {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(self).write(
+      to: directory.appendingPathComponent(Self.fileName), options: .atomic)
+  }
+
+  static func remove(in directory: URL) throws {
+    let url = directory.appendingPathComponent(fileName)
+    guard FileManager.default.fileExists(atPath: url.path) else { return }
+    try FileManager.default.removeItem(at: url)
+  }
+
+  /// Ids worth resuming: a job that already has a transcription id.
+  var hasPaidWork: Bool { jobs.contains { $0.transcriptionId != nil } }
+}
+
+/// Serializes read-modify-write on the ledger file. The mic and far-end jobs run
+/// concurrently and both record their ids, so unsynchronised writes would lose
+/// one - and a lost id is a paid job that can never be resumed.
+actor LedgerStore {
+  private let directory: URL
+  private var ledger: TranscriptionJobLedger
+
+  init(directory: URL, desired: TranscriptionJobLedger) throws {
+    self.directory = directory
+    if let existing = TranscriptionJobLedger.load(in: directory), existing.hasPaidWork {
+      ledger = existing
+    } else {
+      ledger = desired
+      try desired.save(in: directory)
+    }
+  }
+
+  func snapshot() -> TranscriptionJobLedger { ledger }
+
+  func fileId(for role: TranscriptionJobRole) -> String? {
+    ledger.jobs.first { $0.role == role }?.fileId
+  }
+
+  func transcriptionId(for role: TranscriptionJobRole) -> String? {
+    ledger.jobs.first { $0.role == role }?.transcriptionId
+  }
+
+  func setFileId(_ id: String, for role: TranscriptionJobRole) throws {
+    try mutate(role) { $0.fileId = id }
+  }
+
+  func setTranscriptionId(_ id: String, for role: TranscriptionJobRole) throws {
+    try mutate(role) { $0.transcriptionId = id }
+  }
+
+  /// Forgets a job that failed terminally: its id bought nothing, so keeping it
+  /// would make every retry re-poll a permanently failed transcription.
+  func clear(role: TranscriptionJobRole) throws {
+    try mutate(role) {
+      $0.fileId = nil
+      $0.transcriptionId = nil
+    }
+  }
+
+  func remoteIds() -> (transcriptionIds: [String], fileIds: [String]) {
+    (ledger.jobs.compactMap(\.transcriptionId), ledger.jobs.compactMap(\.fileId))
+  }
+
+  /// Called only after the transcript sidecar is atomically committed.
+  func finish() throws {
+    try TranscriptionJobLedger.remove(in: directory)
+  }
+
+  private func mutate(
+    _ role: TranscriptionJobRole,
+    _ change: (inout TranscriptionJobLedger.Job) -> Void
+  ) throws {
+    guard let index = ledger.jobs.firstIndex(where: { $0.role == role }) else {
+      throw TranscriptionError.transcriptionFailed("ledger is missing \(role.rawValue) job")
+    }
+    change(&ledger.jobs[index])
+    try ledger.save(in: directory)
   }
 }
 
@@ -217,102 +347,227 @@ final class TranscriptionService {
     self.apiKey = apiKey
   }
 
-  /// Transcribes the local mic and far end separately when both are available.
+  /// Transcribes a recording, resuming any Soniox job it has already paid for.
+  ///
+  /// The async API bills input audio when a job is *created*, not when its
+  /// transcript is fetched, so a job id on disk is money already spent. Two rules
+  /// follow and both are load-bearing: a pending paid plan wins over the caller's
+  /// current mode, and no remote object is deleted before its transcript is in hand.
   func transcribe(
     fileURL: URL,
     languageHints: [String],
+    separateTracks: Bool,
     onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
   ) async throws -> TranscriptDocument {
+    let directory = fileURL.deletingLastPathComponent()
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
-    let metadata = RecordingMetadata.load(in: fileURL.deletingLastPathComponent())
-    let trackMap = RecordingTrackMap.resolve(metadata: metadata, trackCount: tracks.count)
+    let metadata = RecordingMetadata.load(in: directory)
+    let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: tracks.count)
 
-    if let micTrackIndex = trackMap.micIndex,
-      let farEndTrackIndex = trackMap.farEndIndex,
-      micTrackIndex != farEndTrackIndex,
-      tracks.indices.contains(micTrackIndex),
-      tracks.indices.contains(farEndTrackIndex)
-    {
+    let desiredPlan = Self.planJobs(
+      separateTracks: separateTracks, map: map, trackCount: tracks.count)
+    let store = try LedgerStore(
+      directory: directory,
+      desired: TranscriptionJobLedger(
+        jobs: desiredPlan.map { .init(role: $0.role, fileId: nil, transcriptionId: nil) },
+        languageHints: languageHints,
+        separateTracks: separateTracks,
+        createdAt: .now))
+    let ledger = await store.snapshot()
+    let plan = try Self.planJobs(
+      for: ledger.jobs.map(\.role), map: map, trackCount: tracks.count)
+
+    if ledger.hasPaidWork {
       Log.info(
         Log.transcription, "transcription",
-        "separate mic and far-end tracks detected; transcribing concurrently")
-      let micUploadURL = try await Self.extractTrack(from: fileURL, at: micTrackIndex)
-      defer { try? FileManager.default.removeItem(at: micUploadURL) }
-      let farEndUploadURL = try await Self.extractTrack(from: fileURL, at: farEndTrackIndex)
-      defer { try? FileManager.default.removeItem(at: farEndUploadURL) }
-
-      async let micDocument = transcribeUploadedFile(
-        micUploadURL,
-        languageHints: languageHints,
-        enableDiarization: false,
-        onStatus: onStatus
+        "resuming \(ledger.jobs.count) already-billed job(s); current settings ignored for this run"
       )
-      async let farEndDocument = transcribeUploadedFile(
-        farEndUploadURL,
-        languageHints: languageHints,
-        enableDiarization: true,
-        onStatus: onStatus
-      )
-      var (localDocument, remoteDocument) = try await (micDocument, farEndDocument)
-      localDocument.segments = localDocument.segments.map {
-        var segment = $0
-        segment.speaker = -1
-        return segment
-      }
-      remoteDocument.segments = remoteDocument.segments.map {
-        var segment = $0
-        segment.speaker = max(0, segment.speaker)
-        return segment
-      }
-
-      let document = Self.mergeDocuments([localDocument, remoteDocument])
-      onStatus(.completed)
-      return document
     }
 
-    let uploadURL = tracks.count >= 2 ? try await Self.mixTracks(from: fileURL) : fileURL
-    defer {
-      if uploadURL != fileURL {
-        try? FileManager.default.removeItem(at: uploadURL)
+    var byRole: [TranscriptionJobRole: TranscriptDocument] = [:]
+    try await withThrowingTaskGroup(of: (TranscriptionJobRole, TranscriptDocument).self) {
+      group in
+      for job in plan {
+        group.addTask {
+          let document = try await self.runJob(
+            job, fileURL: fileURL, languageHints: ledger.languageHints, store: store,
+            onStatus: onStatus)
+          return (job.role, document)
+        }
       }
+      for try await (role, document) in group { byRole[role] = document }
     }
-    let document = try await transcribeUploadedFile(
-      uploadURL,
-      languageHints: languageHints,
-      enableDiarization: true,
-      onStatus: onStatus
-    )
+    let document = Self.combine(byRole)
+
+    let ids = try await Self.commitCompletedTranscript(
+      document, in: directory, store: store)
+    fireAndForgetCleanup(transcriptionIds: ids.transcriptionIds, fileIds: ids.fileIds)
     onStatus(.completed)
     return document
   }
 
-  private func transcribeUploadedFile(
-    _ fileURL: URL,
+  /// Commits local output before releasing the paid remote job. Kept separate
+  /// so the ordering is testable without contacting Soniox.
+  static func commitCompletedTranscript(
+    _ document: TranscriptDocument,
+    in directory: URL,
+    store: LedgerStore
+  ) async throws -> (transcriptionIds: [String], fileIds: [String]) {
+    try document.save(for: directory)
+    let ids = await store.remoteIds()
+    try await store.finish()
+    return ids
+  }
+
+  /// One Soniox job: which side of the call it covers, which track feeds it, and
+  /// whether that side needs speaker splitting.
+  private struct PlannedJob: Sendable {
+    let role: TranscriptionJobRole
+    /// Track to upload. `nil` means "no single track carries this" - the upload is
+    /// mixed on the fly instead.
+    let trackIndex: Int?
+    let diarization: Bool
+  }
+
+  private static func planJobs(
+    separateTracks: Bool, map: RecordingTrackMap, trackCount: Int
+  ) -> [PlannedJob] {
+    if separateTracks, let mic = map.micIndex, let farEnd = map.farEndIndex, mic != farEnd,
+      (0..<trackCount).contains(mic), (0..<trackCount).contains(farEnd)
+    {
+      return [
+        PlannedJob(role: .mic, trackIndex: mic, diarization: false),
+        PlannedJob(role: .farEnd, trackIndex: farEnd, diarization: true),
+      ]
+    }
+    // A rendered `mixed` track is already the full join, so it is uploaded as-is.
+    return [PlannedJob(role: .single, trackIndex: map.mixedIndex, diarization: true)]
+  }
+
+  /// Reconstructs the plan from a paid ledger. The current settings cannot
+  /// change which paid jobs are resumed.
+  private static func planJobs(
+    for roles: [TranscriptionJobRole], map: RecordingTrackMap, trackCount: Int
+  ) throws -> [PlannedJob] {
+    guard !roles.isEmpty, Set(roles).count == roles.count else {
+      throw TranscriptionError.transcriptionFailed("invalid transcription job ledger")
+    }
+    return try roles.map { role in
+      switch role {
+      case .mic:
+        guard let index = map.micIndex, (0..<trackCount).contains(index) else {
+          throw TranscriptionError.transcriptionFailed("recording no longer has a microphone track")
+        }
+        return PlannedJob(role: .mic, trackIndex: index, diarization: false)
+      case .farEnd:
+        guard let index = map.farEndIndex, (0..<trackCount).contains(index) else {
+          throw TranscriptionError.transcriptionFailed("recording no longer has a desktop track")
+        }
+        return PlannedJob(role: .farEnd, trackIndex: index, diarization: true)
+      case .single:
+        return PlannedJob(role: .single, trackIndex: map.mixedIndex, diarization: true)
+      }
+    }
+  }
+
+  private func runJob(
+    _ job: PlannedJob,
+    fileURL: URL,
     languageHints: [String],
-    enableDiarization: Bool,
+    store: LedgerStore,
     onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
   ) async throws -> TranscriptDocument {
-    onStatus(.uploading)
-    let fileId = try await uploadFile(fileURL)
-    var transcriptionId: String?
+    if let paid = await store.transcriptionId(for: job.role) {
+      Log.info(
+        Log.transcription, "transcription",
+        "resuming paid job \(paid) (\(job.role.rawValue))")
+      return try await pollAndFetch(
+        transcriptionId: paid, role: job.role, store: store, onStatus: onStatus)
+    }
 
+    var fileId = await store.fileId(for: job.role)
+    if fileId == nil {
+      onStatus(.uploading)
+      let uploadURL = try await Self.uploadURL(for: job, fileURL: fileURL)
+      defer {
+        if uploadURL != fileURL { try? FileManager.default.removeItem(at: uploadURL) }
+      }
+      let uploaded = try await uploadFile(uploadURL)
+      try await store.setFileId(uploaded, for: job.role)
+      fileId = uploaded
+    }
+    guard let fileId else { throw TranscriptionError.uploadFailed("missing file id") }
+
+    onStatus(.queued)
+    let transcriptionId = try await createTranscription(
+      fileId: fileId, languageHints: languageHints, enableDiarization: job.diarization)
     do {
-      onStatus(.queued)
-      transcriptionId = try await createTranscription(
-        fileId: fileId,
-        languageHints: languageHints,
-        enableDiarization: enableDiarization
-      )
-      try await pollUntilComplete(transcriptionId: transcriptionId!, onStatus: onStatus)
-      let document = try await fetchTranscript(transcriptionId: transcriptionId!)
-      fireAndForgetCleanup(transcriptionIds: [transcriptionId!], fileIds: [fileId])
-      return document
+      try await store.setTranscriptionId(transcriptionId, for: job.role)
     } catch {
-      fireAndForgetCleanup(
-        transcriptionIds: [transcriptionId].compactMap { $0 }, fileIds: [fileId])
+      // Billed but unrecordable. Put the id somewhere durable anyway so the work
+      // can still be recovered by hand instead of silently paid for twice.
+      Log.error(
+        Log.transcription, "transcription",
+        "PAID job \(transcriptionId) could not be recorded: \(error.localizedDescription)")
       throw error
     }
+
+    return try await pollAndFetch(
+      transcriptionId: transcriptionId, role: job.role, store: store, onStatus: onStatus)
+  }
+
+  private static func uploadURL(for job: PlannedJob, fileURL: URL) async throws -> URL {
+    if let index = job.trackIndex {
+      return try await extractTrack(from: fileURL, at: index)
+    }
+    return try await mixTracks(from: fileURL)
+  }
+
+  private func pollAndFetch(
+    transcriptionId: String,
+    role: TranscriptionJobRole,
+    store: LedgerStore,
+    onStatus: @escaping @MainActor (TranscriptionStatus) -> Void
+  ) async throws -> TranscriptDocument {
+    do {
+      try await pollUntilComplete(transcriptionId: transcriptionId, onStatus: onStatus)
+    } catch let error as TranscriptionError {
+      // Only a terminal API failure means the id bought nothing. Cancellation,
+      // network drops and HTTP errors all keep it for the next attempt.
+      if case .jobFailed = error {
+        try await store.clear(role: role)
+        fireAndForgetCleanup(transcriptionIds: [transcriptionId], fileIds: [])
+      }
+      throw error
+    }
+    return try await fetchTranscript(transcriptionId: transcriptionId)
+  }
+
+  /// Folds per-role transcripts into one document on a shared timeline.
+  private static func combine(
+    _ byRole: [TranscriptionJobRole: TranscriptDocument]
+  ) -> TranscriptDocument {
+    if let single = byRole[.single] { return single }
+    let local = byRole[.mic].map { document in
+      var adjusted = document
+      adjusted.segments = document.segments.map {
+        var segment = $0
+        segment.speaker = -1
+        return segment
+      }
+      return adjusted
+    }
+    let remote = byRole[.farEnd].map { document in
+      var adjusted = document
+      adjusted.segments = document.segments.map {
+        var segment = $0
+        segment.speaker = max(0, segment.speaker)
+        return segment
+      }
+      return adjusted
+    }
+    return mergeDocuments([local, remote].compactMap { $0 })
   }
 
   // MARK: - Audio Mixing & Export
@@ -573,7 +828,7 @@ final class TranscriptionService {
           json?["error_message"] as? String
           ?? json?["error_type"] as? String
           ?? "unknown error"
-        throw TranscriptionError.transcriptionFailed(message)
+        throw TranscriptionError.jobFailed(message)
       default:
         break
       }

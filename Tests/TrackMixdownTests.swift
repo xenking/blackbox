@@ -92,6 +92,20 @@ struct TrackMixdownTests {
     #expect(mixedRMS > 0.001, "Mixed track is silent (RMS=\(mixedRMS))")
   }
 
+  @Test("can retain the native separate-track recording")
+  func skipsMixedTrackWhenDisabled() async throws {
+    let directory = try await makeRecording(includeMic: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let audioURL = directory.appendingPathComponent("audio.m4a")
+    let originalData = try Data(contentsOf: audioURL)
+
+    await TrackMixdown.render(recordingDirectory: directory, includeMixedTrack: false)
+
+    #expect(try await audioTrackCount(at: audioURL) == 2)
+    #expect(try Data(contentsOf: audioURL) == originalData)
+    #expect(RecordingMetadata.load(in: directory)?.tracks == [.system, .mic])
+  }
+
   @Test("leaves recordings without work unchanged")
   func leavesNoopInputsUntouched() async throws {
     let singleTrackDirectory = try await makeRecording(includeMic: false)

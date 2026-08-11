@@ -7,11 +7,12 @@ import Foundation
 enum TrackMixdown {
 
   /// Rewrites `audio.m4a` in place into the canonical 3-track layout.
-  /// No-op when the recording already has a mixed track or lacks a mic/far-end pair.
-  static func render(recordingDirectory: URL) async {
+  /// When disabled, recording remains the native `[system, mic]` layout.
+  static func render(recordingDirectory: URL, includeMixedTrack: Bool = true) async {
     do {
       let didRender = try await Task.detached {
-        try await Self.run(recordingDirectory: recordingDirectory)
+        try await Self.run(
+          recordingDirectory: recordingDirectory, includeMixedTrack: includeMixedTrack)
       }.value
       if didRender {
         Log.info(Log.recorder, "mixdown", "rendered mixed, mic, and system tracks")
@@ -23,12 +24,22 @@ enum TrackMixdown {
 
   // MARK: - Background Pipeline
 
-  nonisolated private static func run(recordingDirectory: URL) async throws -> Bool {
+  nonisolated private static func run(
+    recordingDirectory: URL, includeMixedTrack: Bool
+  ) async throws -> Bool {
     let originalURL = recordingDirectory.appendingPathComponent("audio.m4a")
     let metadata = RecordingMetadata.load(in: recordingDirectory)
     let asset = AVURLAsset(url: originalURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
     let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: tracks.count)
+
+    guard includeMixedTrack else {
+      guard var metadata, tracks.count == 2, map.mixedIndex == nil else { return false }
+      metadata.tracks = [.system, .mic]
+      metadata.trackCount = 2
+      try metadata.save(in: recordingDirectory)
+      return false
+    }
 
     guard map.mixedIndex == nil else { return false }
     guard let micIndex = map.micIndex, let farEndIndex = map.farEndIndex else { return false }

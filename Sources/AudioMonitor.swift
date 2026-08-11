@@ -61,6 +61,7 @@ final class AudioMonitor {
   var notifyOnError: Bool = true
   var excludedBundleIDs: Set<String> = []
   var excludedTitlePatterns: Set<String> = []
+  var writeMixedTrack: Bool = true
 
   private var errorGeneration = 0
 
@@ -146,8 +147,10 @@ final class AudioMonitor {
   }
 
   private func scheduleTrackMixdown(for recordingDirectory: URL) {
+    let writeMixedTrack = writeMixedTrack
     Task {
-      await TrackMixdown.render(recordingDirectory: recordingDirectory)
+      await TrackMixdown.render(
+        recordingDirectory: recordingDirectory, includeMixedTrack: writeMixedTrack)
     }
   }
 
@@ -795,6 +798,9 @@ final class AudioMonitor {
     }
     if excludedTitlePatterns != settings.excludedTitlePatterns {
       excludedTitlePatterns = settings.excludedTitlePatterns
+    }
+    if writeMixedTrack != settings.writeMixedTrack {
+      writeMixedTrack = settings.writeMixedTrack
     }
 
     let nextMicPermissionNeeded =

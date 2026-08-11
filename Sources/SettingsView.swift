@@ -20,6 +20,8 @@ struct SettingsView: View {
   @AppStorage("excludedTitlePatterns") private var excludedTitlePatternsRaw = ""
   @AppStorage("transcriptionLanguages") private var transcriptionLanguages =
     defaultTranscriptionLanguages
+  @AppStorage("writeMixedTrack") private var writeMixedTrack = true
+  @AppStorage("transcribeSeparateTracks") private var transcribeSeparateTracks = true
   @State private var newTitlePattern = ""
   @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
   @State private var apiKeySaveTask: Task<Void, Never>?
@@ -341,6 +343,12 @@ struct SettingsView: View {
           .foregroundStyle(.secondary)
       }
 
+      Toggle("Write a mixed track", isOn: $writeMixedTrack)
+      Text(
+        "Track 0 contains microphone plus desktop audio for normal players. Disable to keep only separate desktop and microphone tracks."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
       TextField("Name prefix", text: $namePrefixTemplate)
       Text(
         "Prepended to new recording names, e.g. \"\(formatNamePrefix(template: namePrefixTemplate, date: Date()))Zoom\". Tokens: YYYY, YY, MM, DD. Leave empty for no prefix."
@@ -359,6 +367,18 @@ struct SettingsView: View {
         .help("Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en.")
       Text(
         "Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      Picker("Soniox source", selection: $transcribeSeparateTracks) {
+        Text("Separate microphone and desktop").tag(true)
+        Text("Mixed track with diarization").tag(false)
+      }
+      .pickerStyle(.segmented)
+      Text(
+        transcribeSeparateTracks
+          ? "Transcribes your microphone separately; speaker diarization is used only for desktop audio."
+          : "Transcribes the mixed track with speaker diarization."
       )
       .font(.caption)
       .foregroundStyle(.secondary)

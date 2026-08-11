@@ -77,6 +77,8 @@ struct AudioMonitorSettings: Sendable {
   /// auto-recording - this is how a single browser tab (whose title is the
   /// window title) is excluded without excluding the whole browser.
   var excludedTitlePatterns: Set<String> = []
+  /// Render an additional track 0 containing mic plus desktop audio after stop.
+  var writeMixedTrack: Bool = true
 
   /// Parses a comma-separated UserDefaults list value (`excludedBundleIDs`,
   /// `excludedTitlePatterns`). Single source of truth for the storage format
@@ -166,7 +168,8 @@ struct AudioMonitorDependencies {
           notifyOnStart: false,
           notifyOnSaved: false,
           notifyOnError: false,
-          namePrefixTemplate: ""
+          namePrefixTemplate: "",
+          writeMixedTrack: true
         )
       }
 
@@ -187,7 +190,8 @@ struct AudioMonitorDependencies {
         excludedTitlePatterns: Set(
           AudioMonitorSettings.parseBundleIDList(
             defaults.string(forKey: "excludedTitlePatterns") ?? ""
-          ).map { $0.lowercased() })
+          ).map { $0.lowercased() }),
+        writeMixedTrack: defaults.object(forKey: "writeMixedTrack") as? Bool ?? true
       )
     },
     microphoneAuthorizationStatus: {
