@@ -1143,40 +1143,72 @@ enum WaveformExtractor {
     reader.add(output)
     guard reader.startReading() else { return [] }
 
-    // First pass: collect all samples into a flat buffer
-    var allSamples: [Int16] = []
-    allSamples.reserveCapacity(48000 * 60 * 5)  // ~5 min at 48kHz pre-alloc
+    // Streaming reduction: accumulate sum-of-squares per fixed-size chunk
+    // instead of buffering every decoded sample. Buffering peaked at 1.43 GB
+    // on a 70-minute recording (and scaled linearly), which jetsam-killed the
+    // app when a long call was selected. Memory here is O(duration/chunkFrames)
+    // Doubles - about 500 KB for a 3-hour recording.
+    let chunkFrames = 4096
+    var chunkSumSq: [Double] = []
+    var chunkCount: [Int] = []
+    var pendingSumSq = 0.0
+    var pendingCount = 0
+    var scratch = [Int16](repeating: 0, count: chunkFrames)
 
     while let buffer = output.copyNextSampleBuffer() {
       guard let blockBuffer = CMSampleBufferGetDataBuffer(buffer) else { continue }
       let length = CMBlockBufferGetDataLength(blockBuffer)
       let sampleCount = length / MemoryLayout<Int16>.size
-      let startIndex = allSamples.count
-      allSamples.append(contentsOf: repeatElement(0, count: sampleCount))
-      allSamples.withUnsafeMutableBufferPointer { ptr in
-        guard let base = ptr.baseAddress else { return }
-        _ = CMBlockBufferCopyDataBytes(
-          blockBuffer, atOffset: 0, dataLength: length,
-          destination: base.advanced(by: startIndex))
+      guard sampleCount > 0 else { continue }
+      if scratch.count < sampleCount {
+        scratch = [Int16](repeating: 0, count: sampleCount)
+      }
+      let copied = scratch.withUnsafeMutableBufferPointer { ptr -> Bool in
+        guard let base = ptr.baseAddress else { return false }
+        return CMBlockBufferCopyDataBytes(
+          blockBuffer, atOffset: 0, dataLength: length, destination: base) == kCMBlockBufferNoErr
+      }
+      guard copied else { continue }
+
+      for i in 0..<sampleCount {
+        let s = Float(scratch[i]) / 32768.0
+        pendingSumSq += Double(s * s)
+        pendingCount += 1
+        if pendingCount == chunkFrames {
+          chunkSumSq.append(pendingSumSq)
+          chunkCount.append(pendingCount)
+          pendingSumSq = 0
+          pendingCount = 0
+        }
       }
     }
+    if pendingCount > 0 {
+      chunkSumSq.append(pendingSumSq)
+      chunkCount.append(pendingCount)
+    }
 
-    guard !allSamples.isEmpty else { return [] }
+    guard !chunkSumSq.isEmpty else { return [] }
 
-    // Second pass: downsample into buckets
-    let samplesPerBucket = max(1, allSamples.count / bucketCount)
+    // Fold the chunk reductions into the final buckets. Boundaries are
+    // proportional so every chunk lands in exactly one bucket. This matters
+    // far more here than it did when bucketing raw samples: there are only
+    // ~700 chunks per minute, so `count / bucketCount` floor division would
+    // drop whole minutes off the tail of the waveform. Summing squares rather
+    // than averaging per-chunk RMS values keeps each bucket's RMS exact.
     var result = [Float](repeating: 0, count: bucketCount)
 
     for i in 0..<bucketCount {
-      let start = i * samplesPerBucket
-      let end = min(start + samplesPerBucket, allSamples.count)
-      guard start < end else { continue }
-      var sum: Float = 0
-      for j in start..<end {
-        let s = Float(allSamples[j]) / 32768.0
-        sum += s * s
+      let start = i * chunkSumSq.count / bucketCount
+      let end = max(start + 1, (i + 1) * chunkSumSq.count / bucketCount)
+      guard start < chunkSumSq.count else { continue }
+      var sum = 0.0
+      var n = 0
+      for j in start..<min(end, chunkSumSq.count) {
+        sum += chunkSumSq[j]
+        n += chunkCount[j]
       }
-      result[i] = (sum / Float(end - start)).squareRoot()
+      guard n > 0 else { continue }
+      result[i] = Float((sum / Double(n)).squareRoot())
     }
 
     // Normalize to 0...1
