@@ -73,14 +73,21 @@ enum TrackMixdown {
       outputURL: remuxedURL
     )
 
-    _ = try fileManager.replaceItemAt(originalURL, withItemAt: remuxedURL)
-
+    // Declare the new roles *before* swapping the file in. `RecordingTrackMap`
+    // only trusts declared roles when their count matches the file's real track
+    // count, so the intermediate state (3 roles declared, 2-track file still on
+    // disk) resolves to the correct legacy `[system, mic]` pair. The reverse
+    // order has no safe intermediate: a 3-track file with no declared roles
+    // resolves as the pre-v0.7.0 `[system, perApp, mic]` layout, which silently
+    // swaps mic and system for AEC and transcription.
     guard var updatedMetadata = RecordingMetadata.load(in: recordingDirectory) else {
       throw TrackMixdownError.metadataMissing
     }
     updatedMetadata.tracks = [.mixed, .mic, .system]
     updatedMetadata.trackCount = 3
     try updatedMetadata.save(in: recordingDirectory)
+
+    _ = try fileManager.replaceItemAt(originalURL, withItemAt: remuxedURL)
     return true
   }
 

@@ -333,6 +333,8 @@ final class AudioMonitor {
     isSaving = true
     Task {
       let url = await recorder.stop()
+      savingCount -= 1
+      isSaving = savingCount > 0
       if let url {
         scheduleTrackMixdown(for: url)
         lastSavedRecordingURL = url
@@ -689,6 +691,8 @@ final class AudioMonitor {
     isSaving = true
     Task {
       let url = await recorder.stop()
+      savingCount -= 1
+      isSaving = savingCount > 0
       if let url {
         scheduleTrackMixdown(for: url)
         lastSavedRecordingURL = url

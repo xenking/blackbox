@@ -333,6 +333,46 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  /// `isSaving` drives the menu bar's "saving" indicator. It is refcounted, so
+  /// every stop path that increments the counter has to decrement it again;
+  /// missing one leaves the indicator stuck on for the rest of the session.
+  @Test("every stop path clears the saving indicator")
+  func savingIndicatorClearsAfterEveryStop() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    // Manual stop.
+    harness.activeCallers = ["com.google.Chrome"]
+    monitor.startManualRecording()
+    await settle()
+    try #require(monitor.isManualRecording)
+    monitor.stopManualRecording()
+    await settle()
+    #expect(!monitor.isSaving, "manual stop left the saving indicator on")
+
+    // Auto stop: caller appears, then goes away past the grace period.
+    harness.activeCallers = []
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    harness.activeCallers = ["com.zoom.us"]
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+    try #require(monitor.isRecording, "auto-recording should have started")
+    harness.activeCallers = []
+    harness.clock.advance(by: .seconds(3))  // first inactive poll
+    await settle()
+    harness.clock.advance(by: .seconds(3))  // second inactive poll, grace begins
+    await settle()
+    harness.clock.advance(by: .seconds(6))  // grace expires -> stop
+    await settle()
+    try #require(!monitor.isRecording, "auto-recording should have stopped")
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("suppression filters one bundle but lets other apps trigger auto-record")
   func suppressionDoesNotBlockOtherApps() async throws {
     let harness = MonitorHarness()
