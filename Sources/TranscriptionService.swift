@@ -372,7 +372,9 @@ final class TranscriptionService {
     }
   }
 
-  private static func extractTrack(from fileURL: URL, at index: Int) async throws -> URL {
+  /// Internal rather than private so tests can prove the per-track split without
+  /// a live API key: this is the step that decides what audio Soniox actually hears.
+  static func extractTrack(from fileURL: URL, at index: Int) async throws -> URL {
     let asset = AVURLAsset(url: fileURL)
     let tracks = try await asset.loadTracks(withMediaType: .audio)
     guard tracks.indices.contains(index) else {
