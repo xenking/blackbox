@@ -35,6 +35,14 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// Language hints the job was planned with, kept so a resumed job asks Soniox
   /// for what the paid ones were asked for.
   var languageHints: [String] = []
+  /// Everything the request was planned with: hints, context, diarization.
+  /// Frozen at planning for the same reason as `languageHints`, which it
+  /// supersedes; a job written before it existed resumes from `languageHints`.
+  var config: TranscriptionConfig?
+  /// Set when the user asked for this run with explicit options. Used in place
+  /// of Settings when the job is planned, and kept until then so a launch that
+  /// resumes the job before it ever planned still honours it.
+  var configOverride: TranscriptionConfig?
   var attempts: Int = 0
   /// Whether the job came from the auto-transcribe setting rather than an
   /// explicit user action. Resume re-checks the setting for these.
@@ -51,15 +59,19 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case parts = "jobs"
-    case languageHints, attempts, isAutomatic, lastError, awaitingRemoteDelete
+    case languageHints, config, configOverride, attempts, isAutomatic, lastError,
+      awaitingRemoteDelete
   }
 
   init(
-    parts: [Part] = [], languageHints: [String] = [], attempts: Int = 0,
+    parts: [Part] = [], languageHints: [String] = [], config: TranscriptionConfig? = nil,
+    configOverride: TranscriptionConfig? = nil, attempts: Int = 0,
     isAutomatic: Bool = false, lastError: String? = nil, awaitingRemoteDelete: Bool = false
   ) {
     self.parts = parts
     self.languageHints = languageHints
+    self.config = config
+    self.configOverride = configOverride
     self.attempts = attempts
     self.isAutomatic = isAutomatic
     self.lastError = lastError
@@ -76,6 +88,9 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     parts = try container.decodeIfPresent([Part].self, forKey: .parts) ?? []
     languageHints = try container.decodeIfPresent([String].self, forKey: .languageHints) ?? []
+    config = try container.decodeIfPresent(TranscriptionConfig.self, forKey: .config)
+    configOverride = try container.decodeIfPresent(
+      TranscriptionConfig.self, forKey: .configOverride)
     attempts = try container.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
     isAutomatic = try container.decodeIfPresent(Bool.self, forKey: .isAutomatic) ?? false
     lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
@@ -113,7 +128,16 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
 
   /// Forgets what a retired cleanup deleted, keeping the plan out of it: the
   /// next run plans afresh against the current settings.
-  mutating func clearRemoteIds() { parts = [] }
+  mutating func clearRemoteIds() {
+    parts = []
+    config = nil
+  }
+
+  /// What `createTranscription` is asked for: the planned config, or - for a
+  /// job planned before configs existed - the hints it was planned with.
+  var effectiveConfig: TranscriptionConfig {
+    config ?? TranscriptionConfig(languageHints: languageHints.isEmpty ? ["ru"] : languageHints)
+  }
 
   static func url(for recordingDirectory: URL) -> URL {
     recordingDirectory.appendingPathComponent(fileName)
@@ -173,21 +197,13 @@ final class TranscriptionCoordinator {
     var isAutoEnabled: () -> Bool = {
       UserDefaults.standard.bool(forKey: SettingsKeys.autoTranscribe)
     }
-    /// Honours the `--ui-test-mode` override for the same reason
-    /// `AudioMonitorDependencies.live` does: otherwise the recorder writes to
-    /// the override directory while resume scans the user's real one.
     /// What a job is planned with the first time it runs. Read once and then
     /// persisted in the job, so changing the setting never reinterprets work
     /// that has already been billed.
-    var transcriptionOptions: () -> (languageHints: [String], separateTracks: Bool) = {
-      let defaults = UserDefaults.standard
-      return (
-        TranscriptionService.languageHints(
-          from: defaults.string(forKey: SettingsKeys.transcriptionLanguages)
-            ?? defaultTranscriptionLanguages),
-        defaults.object(forKey: SettingsKeys.transcribeSeparateTracks) as? Bool ?? true
-      )
-    }
+    var transcriptionOptions: () -> TranscriptionConfig = { TranscriptionConfig.fromDefaults() }
+    /// Honours the `--ui-test-mode` override for the same reason
+    /// `AudioMonitorDependencies.live` does: otherwise the recorder writes to
+    /// the override directory while resume scans the user's real one.
     var saveDirectory: () -> URL = {
       BlackboxTestMode.saveDirectoryOverride
         ?? URL(
@@ -452,7 +468,7 @@ final class TranscriptionCoordinator {
   /// conditional on `lastError` - the offline give-up path leaves a job with
   /// spent attempts and no recorded error, and a Retry there must not go
   /// terminal on the first hiccup.
-  func transcribe(recordingDirectory: URL) {
+  func transcribe(recordingDirectory: URL, configOverride: TranscriptionConfig? = nil) {
     guard apiKey() != nil else { return }
     // The reset below dispatches remote DELETEs and clears the sidecar's ids,
     // and `enqueue`'s in-flight guard is downstream of it - so a request for a
@@ -492,9 +508,11 @@ final class TranscriptionCoordinator {
         job.lastError = nil
         job.attempts = 0
       }
+      // Replaced, not merged: a retry without options goes back to Settings.
+      job.configOverride = configOverride
       job.save(for: recordingDirectory)
     }
-    enqueue(recordingDirectory, isAutomatic: false)
+    enqueue(recordingDirectory, isAutomatic: false, configOverride: configOverride)
   }
 
   /// Discards a recording's job using a record captured *before* the directory
@@ -591,7 +609,9 @@ final class TranscriptionCoordinator {
 
   // MARK: - Queue
 
-  private func enqueue(_ recordingDirectory: URL, isAutomatic: Bool) {
+  private func enqueue(
+    _ recordingDirectory: URL, isAutomatic: Bool, configOverride: TranscriptionConfig? = nil
+  ) {
     let key = recordingDirectory.path
     // Ahead of the in-flight guard on purpose: an explicit request has to
     // outrank the automatic flag even when an automatic job for the same
@@ -605,7 +625,8 @@ final class TranscriptionCoordinator {
     }
     guard jobs[key] == nil else { return }
     if TranscriptionJob.load(for: recordingDirectory) == nil {
-      TranscriptionJob(isAutomatic: isAutomatic).save(for: recordingDirectory)
+      TranscriptionJob(configOverride: configOverride, isAutomatic: isAutomatic)
+        .save(for: recordingDirectory)
     }
     statuses[key] = .queued
     // The sidecar is written either way, so a recording reported during quit is
@@ -695,7 +716,7 @@ final class TranscriptionCoordinator {
         // recording costs, and a plan that has already paid must not be
         // reinterpreted when the user flips a setting.
         if job.parts.isEmpty {
-          let options = dependencies.transcriptionOptions()
+          let options = job.configOverride ?? dependencies.transcriptionOptions()
           let roles = try await service.plan(
             fileURL: audioURL, separateTracks: options.separateTracks)
           guard !roles.isEmpty, Set(roles).count == roles.count else {
@@ -704,6 +725,7 @@ final class TranscriptionCoordinator {
           }
           job.parts = roles.map { TranscriptionJob.Part(role: $0) }
           job.languageHints = options.languageHints
+          job.config = options
           job.save(for: recordingDirectory)
         }
 
@@ -774,7 +796,7 @@ final class TranscriptionCoordinator {
           statuses[key] = .queued
           job.parts[index].transcriptionId = try await service.createTranscription(
             fileId: fileId, reference: name, role: job.parts[index].role,
-            languageHints: job.languageHints)
+            config: job.effectiveConfig)
           job.save(for: recordingDirectory)
         }
 
@@ -794,6 +816,11 @@ final class TranscriptionCoordinator {
 
         do {
           try document.save(for: recordingDirectory)
+          // Best-effort: the sidecar above is the transcript of record, and the
+          // index is rebuilt from it on the next launch if this write fails.
+          await TranscriptIndex.upsert(
+            recordingDirectory: recordingDirectory, document: document,
+            config: job.effectiveConfig)
         } catch {
           // The transcript is paid for and in hand; losing it to a write error
           // is worth an explicit failure rather than a silent retry.

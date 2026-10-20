@@ -479,6 +479,7 @@ struct RecordingsView: View {
       do {
         try FileManager.default.trashItem(at: recording.url, resultingItemURL: nil)
         transcription.forgetDeletedRecording(recordingDirectory: recording.url, job: job)
+        Task { await TranscriptIndex.remove(recordingDirectory: recording.url) }
       } catch {
         failed.append(recording.title)
         Log.error(
@@ -509,6 +510,7 @@ struct RecordingsView: View {
     metadata.title = newTitle
     do {
       try metadata.save(in: recording.url)
+      Task { await TranscriptIndex.refreshMetadata(recordingDirectory: recording.url) }
     } catch {
       // Was `try?`. The list reloads from disk straight afterwards, so a failed
       // write showed the old title again with no explanation - and this is the
@@ -688,6 +690,7 @@ struct RecordingDetailView: View {
   // UI
   @State private var showDeleteConfirmation = false
   @State private var showRetranscribeConfirmation = false
+  @State private var showTranscriptionOptions = false
   @State private var isProcessingAEC = false
   /// Set when the user scrolls the transcript themselves, so following the
   /// playhead never yanks the view out from under them. Cleared by the
@@ -860,6 +863,15 @@ struct RecordingDetailView: View {
           .accessibilityLabel("Transcribe Again")
           .help("Transcribe again - replaces the current transcript")
           .disabled(transcriptionStatus.isActive)
+
+          Button {
+            showTranscriptionOptions = true
+          } label: {
+            Image(systemName: "slider.horizontal.3")
+          }
+          .accessibilityLabel("Transcribe With Options")
+          .help("Transcribe with a different language, context or diarization")
+          .disabled(transcriptionStatus.isActive)
         }
 
         // A recording that captured nothing has no mic track to clean, so the
@@ -906,6 +918,11 @@ struct RecordingDetailView: View {
       Alert(
         title: Text(error.title), message: Text(error.message),
         dismissButton: .default(Text("OK")))
+    }
+    .sheet(isPresented: $showTranscriptionOptions) {
+      TranscriptionOptionsSheet(hasTranscript: transcript != nil) { config in
+        transcription.transcribe(recordingDirectory: recording.url, configOverride: config)
+      }
     }
     .alert("Transcribe Again?", isPresented: $showRetranscribeConfirmation) {
       Button("Transcribe Again") { startTranscription() }
@@ -1264,6 +1281,7 @@ struct RecordingDetailView: View {
     do {
       try meta.save(in: recording.url)
       metadata = meta
+      Task { await TranscriptIndex.refreshMetadata(recordingDirectory: recording.url) }
     } catch {
       // Was `try?` in all three rename paths, and two of them then assigned the
       // in-memory copy anyway - so the UI showed a rename that never reached

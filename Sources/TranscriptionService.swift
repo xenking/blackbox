@@ -192,7 +192,7 @@ nonisolated enum RecordingStore {
     else { return [] }
     return
       names
-      .filter { !$0.hasPrefix(".") }
+      .filter { !$0.hasPrefix(".") && !$0.hasPrefix(TranscriptIndex.fileName) }
       .map { saveDirectory.appendingPathComponent($0, isDirectory: true) }
   }
 }
@@ -488,7 +488,7 @@ nonisolated protocol TranscriptionServicing: Sendable {
   ) async throws -> String
   /// Billing starts here: the returned id is money already spent.
   @concurrent func createTranscription(
-    fileId: String, reference: String, role: TranscriptionJobRole, languageHints: [String]
+    fileId: String, reference: String, role: TranscriptionJobRole, config: TranscriptionConfig
   ) async throws -> String
   @concurrent func awaitCompletion(transcriptionId: String) async throws
   @concurrent func fetchTranscript(transcriptionId: String) async throws -> TranscriptDocument
@@ -942,18 +942,17 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
 
   @concurrent
   func createTranscription(
-    fileId: String, reference: String, role: TranscriptionJobRole, languageHints: [String]
+    fileId: String, reference: String, role: TranscriptionJobRole, config: TranscriptionConfig
   ) async throws -> String {
-    var config = Self.transcriptionConfiguration(
-      model: model, fileId: fileId, languageHints: languageHints,
-      enableDiarization: Self.diarizes(role))
+    var body = Self.transcriptionConfiguration(
+      model: model, fileId: fileId, role: role, config: config)
     // Ties the remote job back to a recording directory, so an artifact this
     // client loses track of is still identifiable in the Soniox console.
-    config["client_reference_id"] = String(reference.prefix(Self.referenceLimit))
+    body["client_reference_id"] = String(reference.prefix(Self.referenceLimit))
 
     var request = try makeRequest(.post, "/v1/transcriptions")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(withJSONObject: config)
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
     let (data, response) = try await URLSession.shared.data(for: request)
     try checkHTTPResponse(response, data: data, context: "create transcription")
@@ -967,23 +966,27 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     return transcriptionId
   }
 
-  /// A transcription request deliberately carries no inferred context. Context
-  /// is an accuracy bias, not a source of truth: Blackbox has no pre-recording
-  /// agenda or participant data, and must not bias the desktop-only job toward
-  /// the local speaker from a transcript it does not yet have.
+  /// The request body. Context and every flag come from `config` - Settings or
+  /// the per-run options - and never from the recording itself: Blackbox has no
+  /// pre-recording agenda or participant data, and must not bias the
+  /// desktop-only job toward the local speaker from a transcript it does not yet
+  /// have.
   static func transcriptionConfiguration(
     model: String,
     fileId: String,
-    languageHints: [String],
-    enableDiarization: Bool
+    role: TranscriptionJobRole,
+    config: TranscriptionConfig
   ) -> [String: Any] {
-    [
+    var body: [String: Any] = [
       "model": model,
       "file_id": fileId,
-      "language_hints": languageHints,
-      "enable_speaker_diarization": enableDiarization,
-      "enable_language_identification": true,
+      "language_hints": config.languageHints,
+      "enable_speaker_diarization": config.diarization ?? diarizes(role),
+      "enable_language_identification": config.languageIdentification,
     ]
+    if config.languageHintsStrict { body["language_hints_strict"] = true }
+    if !config.context.isEmpty { body["context"] = config.context.requestObject }
+    return body
   }
 
   // MARK: - Poll

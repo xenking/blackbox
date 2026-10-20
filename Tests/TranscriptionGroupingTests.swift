@@ -106,11 +106,11 @@ struct TranscriptionGroupingTests {
     #expect(roles.map(TranscriptionService.diarizes) == [false, true])
 
     let mic = TranscriptionService.transcriptionConfiguration(
-      model: TranscriptionService.defaultModel, fileId: "mic", languageHints: ["ru"],
-      enableDiarization: TranscriptionService.diarizes(roles[0]))
+      model: TranscriptionService.defaultModel, fileId: "mic", role: roles[0],
+      config: TranscriptionConfig(languageHints: ["ru"]))
     let desktop = TranscriptionService.transcriptionConfiguration(
-      model: TranscriptionService.defaultModel, fileId: "desktop", languageHints: ["ru"],
-      enableDiarization: TranscriptionService.diarizes(roles[1]))
+      model: TranscriptionService.defaultModel, fileId: "desktop", role: roles[1],
+      config: TranscriptionConfig(languageHints: ["ru"]))
     #expect(mic["enable_speaker_diarization"] as? Bool == false)
     #expect(desktop["enable_speaker_diarization"] as? Bool == true)
     #expect(mic["context"] == nil)

@@ -92,7 +92,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
   private(set) var planCount = 0
   private(set) var uploadedRoles: [TranscriptionJobRole] = []
   private(set) var createdRoles: [TranscriptionJobRole] = []
-  private(set) var languageHints: [[String]] = []
+  private(set) var configs: [TranscriptionConfig] = []
   /// Transcription ids whose transcript is empty, as a muted mic's would be.
   private var silentTranscriptionIds: Set<String> = []
   /// Fails the Nth `createTranscription` call (1-based) once, then recovers.
@@ -138,7 +138,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
   }
 
   func createTranscription(
-    fileId: String, reference: String, role: TranscriptionJobRole, languageHints: [String]
+    fileId: String, reference: String, role: TranscriptionJobRole, config: TranscriptionConfig
   ) async throws -> String {
     createCount += 1
     if createCount == failCreateAt {
@@ -147,7 +147,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
     }
     references.append(reference)
     createdRoles.append(role)
-    self.languageHints.append(languageHints)
+    configs.append(config)
     return "transcription-\(createCount)"
   }
 
@@ -230,7 +230,9 @@ final class TranscriptionHarness {
         makeService: { [service] _ in service },
         apiKey: { [weak self] in self?.apiKey ?? nil },
         isAutoEnabled: { [weak self] in self?.autoEnabled ?? false },
-        transcriptionOptions: { [weak self] in (self?.languageHints ?? ["ru"], true) },
+        transcriptionOptions: { [weak self] in
+          TranscriptionConfig(languageHints: self?.languageHints ?? ["ru"])
+        },
         saveDirectory: { [root] in root },
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
         durationSeconds: { [weak self] _ in await self?.duration },
@@ -1387,7 +1389,7 @@ struct TranscriptionCoordinatorTests {
 
     #expect(await harness.service.uploadedRoles == [.mic, .farEnd])
     #expect(await harness.service.createdRoles == [.mic, .farEnd])
-    #expect(await harness.service.languageHints == [["ru", "en"], ["ru", "en"]])
+    #expect(await harness.service.configs.map(\.languageHints) == [["ru", "en"], ["ru", "en"]])
     let transcript = try #require(TranscriptDocument.load(for: directory))
     // One shared timeline; the mic is the one known speaker, rendered as -1.
     #expect(transcript.segments.map(\.text) == ["far words", "mic words"])
@@ -1506,5 +1508,53 @@ struct TranscriptionCoordinatorTests {
     #expect(job.transcriptionIds == ["t1"])
     #expect(job.fileIds == ["f1", "f2"])
     #expect(job.languageHints == ["ru"])
+  }
+
+  // MARK: - Per-run config
+
+  @Test("a per-run override replaces Settings, and is the config every part is created with")
+  func overrideReplacesSettings() async throws {
+    let harness = try TranscriptionHarness()
+    harness.languageHints = ["ru"]
+    await harness.service.setPlannedRoles([.mic, .farEnd])
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    let override = TranscriptionConfig(
+      languageHints: ["en"], diarization: true,
+      context: SonioxContext(generalLines: "topic: launch", terms: "Blackbox", text: ""))
+
+    coordinator.transcribe(recordingDirectory: directory, configOverride: override)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.configs == [override, override])
+  }
+
+  @Test("a job resumed after planning keeps the config it was planned with")
+  func resumedJobKeepsPlannedConfig() async throws {
+    let harness = try TranscriptionHarness()
+    harness.languageHints = ["de"]  // Settings changed since planning
+    let directory = try harness.makeRecording("call-1")
+    let planned = TranscriptionConfig(
+      languageHints: ["en"], languageHintsStrict: true,
+      context: SonioxContext(generalLines: "", terms: "Soniox", text: ""))
+    TranscriptionJob(
+      parts: [.init(role: .single, fileId: "file-1")], config: planned
+    ).save(for: directory)
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.resumePendingJobs()
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.configs == [planned])
+  }
+
+  @Test("a job record from before configs existed still resumes with its language hints")
+  func legacyJobResumesWithHints() throws {
+    let json = #"{"languageHints":["en","fr"],"jobs":[{"role":"single","fileId":"f"}]}"#
+    let job = try JSONDecoder().decode(TranscriptionJob.self, from: Data(json.utf8))
+
+    #expect(job.config == nil)
+    #expect(job.effectiveConfig.languageHints == ["en", "fr"])
+    #expect(job.effectiveConfig.separateTracks)
   }
 }

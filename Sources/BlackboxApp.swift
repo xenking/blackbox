@@ -242,6 +242,7 @@ struct BlackboxApp: App {
           fileURLWithPath: UserDefaults.standard.string(forKey: SettingsKeys.saveDirectoryPath)
             ?? defaultSaveDirectoryPath)
       Task.detached { AECProcessor.sweepPartialFiles(in: saveDirectory) }
+      Task.detached { await TranscriptIndex.backfill(in: saveDirectory) }
 
       if willOnboard {
         showOnboarding()

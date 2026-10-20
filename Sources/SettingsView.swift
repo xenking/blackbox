@@ -23,6 +23,13 @@ struct SettingsView: View {
     defaultTranscriptionLanguages
   @AppStorage(SettingsKeys.writeMixedTrack) private var writeMixedTrack = true
   @AppStorage(SettingsKeys.transcribeSeparateTracks) private var transcribeSeparateTracks = true
+  @AppStorage(SettingsKeys.transcriptionDiarization) private var transcriptionDiarization = "auto"
+  @AppStorage(SettingsKeys.transcriptionLanguageHintsStrict) private var languageHintsStrict = false
+  @AppStorage(SettingsKeys.transcriptionLanguageIdentification) private var languageIdentification =
+    true
+  @AppStorage(SettingsKeys.transcriptionContextGeneral) private var contextGeneral = ""
+  @AppStorage(SettingsKeys.transcriptionContextTerms) private var contextTerms = ""
+  @AppStorage(SettingsKeys.transcriptionContextText) private var contextText = ""
   @State private var newTitlePattern = ""
   @Environment(TranscriptionCoordinator.self) private var transcription
   @Environment(AudioMonitor.self) private var monitor
@@ -503,22 +510,13 @@ struct SettingsView: View {
           .font(.caption)
       }
 
-      TextField("Languages", text: $transcriptionLanguages)
-        .help("Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en.")
+      TranscriptionOptionsFields(
+        languages: $transcriptionLanguages, languageHintsStrict: $languageHintsStrict,
+        languageIdentification: $languageIdentification, diarization: $transcriptionDiarization,
+        separateTracks: $transcribeSeparateTracks, contextGeneral: $contextGeneral,
+        contextTerms: $contextTerms, contextText: $contextText)
       Text(
-        "Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en."
-      )
-      .font(.caption)
-      .foregroundStyle(.secondary)
-      Picker("Soniox source", selection: $transcribeSeparateTracks) {
-        Text("Separate microphone and desktop").tag(true)
-        Text("Mixed track with diarization").tag(false)
-      }
-      .pickerStyle(.segmented)
-      Text(
-        transcribeSeparateTracks
-          ? "Transcribes your microphone separately; speaker diarization is used only for desktop audio."
-          : "Transcribes the mixed track with speaker diarization."
+        "These are the defaults; \"Transcribe With Options\" on a recording overrides them for one run."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
@@ -869,7 +867,7 @@ enum KeychainHelper {
   }
 }
 
-let defaultTranscriptionLanguages = "ru"
+nonisolated let defaultTranscriptionLanguages = "ru"
 
 /// The System Settings panes this app sends people to. The URL was spelled out
 /// at five call sites across three files, four of them force-unwrapping a
@@ -914,4 +912,10 @@ nonisolated enum SettingsKeys {
   static let writeMixedTrack = "writeMixedTrack"
   static let transcriptionLanguages = "transcriptionLanguages"
   static let transcribeSeparateTracks = "transcribeSeparateTracks"
+  static let transcriptionDiarization = "transcriptionDiarization"
+  static let transcriptionLanguageHintsStrict = "transcriptionLanguageHintsStrict"
+  static let transcriptionLanguageIdentification = "transcriptionLanguageIdentification"
+  static let transcriptionContextGeneral = "transcriptionContextGeneral"
+  static let transcriptionContextTerms = "transcriptionContextTerms"
+  static let transcriptionContextText = "transcriptionContextText"
 }

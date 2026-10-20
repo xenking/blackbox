@@ -12,6 +12,9 @@ Fork changes on top of upstream 0.9.5.
 - Track roles are recorded in `metadata.json`, so recordings made by any previous version keep playing, transcribing, and echo-cancelling correctly.
 - Calls can be excluded by window title (Settings > Excluded Window Titles), for a browser used for both recorded and unrecorded calls. Window titles also enrich recording names.
 
+- Transcription options: Settings now has Soniox context (general key/value, terms, background text), strict language hints, per-segment language detection and a diarization override. "Transcribe With Options" on a recording overrides all of them, plus language and source, for a single run.
+- Every transcript is also saved to `transcripts.sqlite` in the recordings folder (full-text search over segments), rebuilt from existing transcripts at launch and cleaned when a recording is deleted. It is the base for an MCP search adapter.
+
 ### Fixed
 
 - App could be killed while opening a recording: drawing the waveform decoded every PCM sample into memory (1.43 GB for a 70-minute call). It is now reduced in one streaming pass, and no longer drops the tail of a recording.

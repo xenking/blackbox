@@ -296,7 +296,8 @@ struct SonioxContractTests {
       apiKey: "k", model: "stt-async-v5", baseURL: server.baseURL)
 
     let id = try await service.createTranscription(
-      fileId: "file-1", reference: "2026-03-11-call", role: .single, languageHints: ["ru"])
+      fileId: "file-1", reference: "2026-03-11-call", role: .single,
+      config: TranscriptionConfig(languageHints: ["ru"]))
     #expect(id == "transcription-1")
 
     let request = try #require(server.requests(path: "/v1/transcriptions").first)
@@ -316,9 +317,11 @@ struct SonioxContractTests {
     let service = TranscriptionService(apiKey: "k", baseURL: server.baseURL)
 
     _ = try await service.createTranscription(
-      fileId: "f", reference: "r", role: .mic, languageHints: ["ru", "en"])
+      fileId: "f", reference: "r", role: .mic,
+      config: TranscriptionConfig(languageHints: ["ru", "en"]))
     _ = try await service.createTranscription(
-      fileId: "f", reference: "r", role: .farEnd, languageHints: ["ru", "en"])
+      fileId: "f", reference: "r", role: .farEnd,
+      config: TranscriptionConfig(languageHints: ["ru", "en"]))
 
     let bodies = try server.requests(path: "/v1/transcriptions").map {
       try #require(try JSONSerialization.jsonObject(with: $0.body) as? [String: Any])
@@ -342,7 +345,8 @@ struct SonioxContractTests {
       apiKey: "k", model: "stt-async-v9-future", baseURL: server.baseURL)
 
     _ = try await service.createTranscription(
-      fileId: "f", reference: "r", role: .single, languageHints: ["ru"])
+      fileId: "f", reference: "r", role: .single, config: TranscriptionConfig(languageHints: ["ru"])
+    )
 
     let request = try #require(server.requests(path: "/v1/transcriptions").first)
     let body = try JSONSerialization.jsonObject(with: request.body) as? [String: Any]
@@ -423,7 +427,8 @@ struct SonioxContractTests {
 
     do {
       _ = try await service.createTranscription(
-        fileId: "f", reference: "r", role: .single, languageHints: ["ru"])
+        fileId: "f", reference: "r", role: .single,
+        config: TranscriptionConfig(languageHints: ["ru"]))
       Issue.record("expected a throw")
     } catch let error as TranscriptionError {
       guard case .balanceExhausted(let message) = error else {
@@ -443,7 +448,8 @@ struct SonioxContractTests {
 
     do {
       _ = try await service.createTranscription(
-        fileId: "f", reference: "r", role: .single, languageHints: ["ru"])
+        fileId: "f", reference: "r", role: .single,
+        config: TranscriptionConfig(languageHints: ["ru"]))
       Issue.record("expected a throw")
     } catch let error as TranscriptionError {
       guard case .serverError(let code, _) = error else {
