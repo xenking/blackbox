@@ -1,0 +1,31 @@
+[package]
+name = "blackbox-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only local MCP server over Blackbox's transcript index (transcripts.sqlite)"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

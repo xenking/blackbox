@@ -64,6 +64,7 @@ struct SettingsView: View {
       transcriptionSection
       permissionsSection
       notificationsSection
+      MCPServerSection()
       excludedAppsSection
       excludedTitlesSection
       debugSection
