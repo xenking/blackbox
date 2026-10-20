@@ -138,6 +138,13 @@ nonisolated enum TranscriptIndex {
   @concurrent
   static func backfill(in saveDirectory: URL) async {
     let directories = RecordingStore.directories(in: saveDirectory)
+    // Readable-and-empty is a real state (the last recording was deleted and the process
+    // died before the unindex ran) and must prune; unreadable (a drive that is not mounted,
+    // a permission change) must not. `directories` cannot tell them apart - both are [] - so
+    // the listing is asked separately. The index is derived, so a wrong prune costs a rebuild,
+    // not data.
+    let listable =
+      (try? FileManager.default.contentsOfDirectory(atPath: saveDirectory.path)) != nil
     let sidecars: [(url: URL, mtime: Double)] = directories.compactMap { url in
       let sidecar = TranscriptDocument.sidecarURL(for: url)
       guard
@@ -168,9 +175,7 @@ nonisolated enum TranscriptIndex {
           db, recordingDirectory: url, document: document, config: document.config,
           sourceMTime: mtime)
       }
-      // An unreadable folder lists as empty; pruning on that would wipe the
-      // index, so rows are only dropped when the listing found something.
-      for name in known.keys where !directories.isEmpty && !present.contains(name) {
+      for name in known.keys where listable && !present.contains(name) {
         try exec(db, "DELETE FROM transcripts WHERE recording = ?", [name])
       }
     }

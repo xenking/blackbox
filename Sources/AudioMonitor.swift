@@ -733,7 +733,8 @@ final class AudioMonitor {
 
     autoRecorder = recorder
     Log.info(
-      Log.monitor, "monitor", "starting auto-recording (call detected, app=\(appName))")
+      Log.monitor, "monitor",
+      "starting auto-recording (call detected, app=\(RecordingNaming.split(appName).app))")
 
     self.autoStartTask = Task { @MainActor [weak self] in
       guard let self else { return }
@@ -785,7 +786,8 @@ final class AudioMonitor {
     autoRecorder = nil
     autoRecordingAppName = nil
     autoRecordingBundleID = nil
-    Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
+    Log.info(
+      Log.monitor, "monitor", "stopping auto-recording (app=\(RecordingNaming.split(appName).app))")
     savingCount += 1
     isSaving = true
     trackSaving { [self] in

@@ -369,4 +369,27 @@ struct TranscriptIndexTests {
     await TranscriptIndex.backfill(in: root)
     #expect(try rows(root, "SELECT count(*) FROM segments") == [["\(expectedSegments)"]])
   }
+
+  @Test("deleting the last recording prunes the index, but an unreadable folder does not wipe it")
+  func emptyFolderPrunesUnreadableDoesNot() async throws {
+    let root = try makeRoot()
+    let directory = try makeRecording(in: root, "only")
+    try document(["kept?"]).save(for: directory)
+    await TranscriptIndex.backfill(in: root)
+    #expect(try rows(root, "SELECT count(*) FROM transcripts") == [["1"]])
+
+    // Unreadable: a drive that is not mounted, or a permission change. Must keep the rows.
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: root.path)
+    await TranscriptIndex.backfill(in: root)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root.path)
+    #expect(try rows(root, "SELECT count(*) FROM transcripts") == [["1"]])
+
+    // Readable and genuinely empty: the app died after trashing the last recording.
+    try FileManager.default.removeItem(at: directory)
+    await TranscriptIndex.backfill(in: root)
+    #expect(try rows(root, "SELECT count(*) FROM transcripts") == [["0"]])
+    #expect(
+      try rows(root, "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'kept'") == [["0"]]
+    )
+  }
 }

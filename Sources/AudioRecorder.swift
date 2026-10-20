@@ -20,6 +20,9 @@ import ObjCExceptionCatcher
 actor AudioRecorder {
   nonisolated let bundleID: String?
   nonisolated let appName: String
+  /// What goes in logs: the bare app. `appName` can carry the window or browser-tab title
+  /// (`RecordingNaming`), which is a meeting name, and diagnostics get copied into bug reports.
+  private nonisolated var logName: String { RecordingNaming.split(appName).app }
   nonisolated let titlePrefix: String
   nonisolated let micEnabled: Bool
   nonisolated let saveDirectory: URL
@@ -168,7 +171,7 @@ actor AudioRecorder {
   func start() async throws {
     precondition(phase == .notStarted, "AudioRecorder.start() called more than once")
     phase = .starting
-    Log.info(Log.recorder, "recorder", "start() for \(appName) (\(bundleID ?? "all"))")
+    Log.info(Log.recorder, "recorder", "start() for \(logName) (\(bundleID ?? "all"))")
 
     do {
       await testStartCheckpoint?(.beforeContent)
@@ -233,7 +236,7 @@ actor AudioRecorder {
       } catch {
         Log.error(
           Log.recorder, "recorder",
-          "screen output subscribe failed for \(appName): \(error.localizedDescription)")
+          "screen output subscribe failed for \(logName): \(error.localizedDescription)")
       }
       self.displayStream = stream
 
@@ -248,7 +251,7 @@ actor AudioRecorder {
       // `phase == .running` guard on handleSystemSampleBuffer accepts buffers
       // from first delivery. No await between here and the flip.
       phase = .running
-      Log.info(Log.recorder, "recorder", "SCStream started for \(appName)")
+      Log.info(Log.recorder, "recorder", "SCStream started for \(logName)")
 
       await testStartCheckpoint?(.afterStreamStart)
       try checkAlive()
@@ -267,7 +270,7 @@ actor AudioRecorder {
         }
       }
     } catch {
-      Log.error(Log.recorder, "recorder", "recording setup failed for \(appName): \(error)")
+      Log.error(Log.recorder, "recorder", "recording setup failed for \(logName): \(error)")
       await cleanupPartialStart()
       phase = .stopped
       throw mappedStartError(error)
@@ -297,7 +300,7 @@ actor AudioRecorder {
     driftTimer = nil
 
     if let stream {
-      await Self.stopCaptureWithTimeout(stream, appName: appName)
+      await Self.stopCaptureWithTimeout(stream, appName: logName)
     }
     if let pipe { _ = await pipe.stop() }
     if let activitySnap { ProcessInfo.processInfo.endActivity(activitySnap) }
@@ -309,7 +312,7 @@ actor AudioRecorder {
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
-    Log.info(Log.recorder, "recorder", "stop() for \(appName) (phase=\(phase))")
+    Log.info(Log.recorder, "recorder", "stop() for \(logName) (phase=\(phase))")
 
     switch phase {
     case .notStarted:
@@ -340,7 +343,7 @@ actor AudioRecorder {
   /// writer, return saved URL.
   private func stopRunning() async -> URL? {
     if let stream = displayStream {
-      await Self.stopCaptureWithTimeout(stream, appName: appName)
+      await Self.stopCaptureWithTimeout(stream, appName: logName)
     }
     self.displayStream = nil
     self.streamProxy = nil
@@ -435,7 +438,7 @@ actor AudioRecorder {
         false, onScreenWindowsOnly: false)
       try checkAlive()
       if let display = content.displays.first {
-        if announced { Log.info(Log.recorder, "recorder", "display is back for \(appName)") }
+        if announced { Log.info(Log.recorder, "recorder", "display is back for \(logName)") }
         return display
       }
       if !announced {
