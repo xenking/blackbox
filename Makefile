@@ -10,18 +10,32 @@ SMOKE_LOCK = /tmp/blackbox-smoke.lock
 SIGN_ID = $(shell security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ENTITLEMENTS = <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
 
-.PHONY: build bundle install run clean format format-check test test-unit check dmg release smoke-install smoke-test smoke
+MCP_BIN = mcp/target/release/blackbox-mcp
+
+.PHONY: build mcp test-mcp bundle install run clean format format-check test test-unit check dmg release smoke-install smoke-test smoke
 
 build:
 	swift build -c release
 
-bundle: build
+# The Rust MCP server (transcript search) that Settings installs as a LaunchAgent.
+# --locked: the build must never silently pick up newer dependency versions.
+mcp:
+	cargo build --release --locked --manifest-path mcp/Cargo.toml
+
+# Clippy-clean is the bar for Rust here; the e2e tests build their database from
+# Sources/TranscriptIndex.swift's own schema, so this also guards schema drift.
+test-mcp:
+	cargo clippy --all-targets --locked --manifest-path mcp/Cargo.toml -- -D warnings
+	cargo test --locked --manifest-path mcp/Cargo.toml
+
+bundle: build mcp
 	@[ -d "$(APP_BUNDLE)" ] && chmod -R u+rw "$(APP_BUNDLE)" || true
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS"
 	mkdir -p "$(APP_BUNDLE)/Contents/Frameworks"
 	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
 	cp .build/release/$(APP_NAME) "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp .build/release/BlackboxWatchdog "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"
+	cp $(MCP_BIN) "$(APP_BUNDLE)/Contents/MacOS/blackbox-mcp"
 	install_name_tool -add_rpath @executable_path/../Frameworks "$(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)"
 	cp Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	cp Assets/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"
@@ -39,6 +53,7 @@ bundle: build
 		done; \
 		codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
 		codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
+		codesign --force --options runtime --sign "$(SIGN_ID)" --timestamp "$(APP_BUNDLE)/Contents/MacOS/blackbox-mcp"; \
 		codesign --force --options runtime --sign "$(SIGN_ID)" --identifier com.tenequm.Blackbox --timestamp --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	else \
 		echo "No Developer ID found, using ad-hoc signing"; \
@@ -47,6 +62,7 @@ bundle: build
 		done; \
 		codesign --force --sign - "$(APP_BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
 		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/BlackboxWatchdog"; \
+		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/blackbox-mcp"; \
 		codesign --force --sign - --identifier com.tenequm.Blackbox --entitlements /dev/stdin "$(APP_BUNDLE)" <<< '$(ENTITLEMENTS)'; \
 	fi
 
@@ -136,7 +152,7 @@ smoke-test: test
 smoke: test
 
 
-check: format build test
+check: format build test-mcp test
 	@echo "All checks passed."
 
 format:

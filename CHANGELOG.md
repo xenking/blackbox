@@ -15,6 +15,8 @@ Fork changes on top of upstream 0.9.5.
 - Transcription options: Settings now has Soniox context (general key/value, terms, background text), strict language hints, per-segment language detection and a diarization override. "Transcribe With Options" on a recording overrides all of them, plus language and source, for a single run.
 - Every transcript is also saved to `transcripts.sqlite` in the recordings folder (full-text search over segments), rebuilt from existing transcripts at launch and cleaned when a recording is deleted. It is the base for an MCP search adapter.
 
+- Local MCP server: Blackbox ships a read-only `blackbox-mcp` that lets an AI agent (Claude Code, Codex, ...) search and read your transcripts - full-text search with date, app, speaker and language filters, recording lists, and paged transcript reading. Settings > Local MCP Server installs it as a LaunchAgent on `127.0.0.1` behind a token that stays on your Mac, and copies ready-made client setup. It also runs over stdio (`blackbox-mcp stdio`) without any network listener. Every answer says which meeting it was: the app, the browser tab or window title, when it started and roughly when it ended.
+
 ### Fixed
 
 - App could be killed while opening a recording: drawing the waveform decoded every PCM sample into memory (1.43 GB for a 70-minute call). It is now reduced in one streaming pass, and no longer drops the tail of a recording.

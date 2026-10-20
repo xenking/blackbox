@@ -12,7 +12,7 @@ import SQLite3
 /// valid), and `backfill` re-derives anything missing or stale from the
 /// sidecars. WAL mode lets a reader and the app work concurrently.
 ///
-/// Schema (`PRAGMA user_version = 1`):
+/// Schema (`PRAGMA user_version = 2`):
 /// - `transcripts`: one row per recording - title, app, times, language,
 ///   provider/model, the `TranscriptionConfig` it was run with, and the
 ///   speaker-name map.
@@ -31,6 +31,9 @@ nonisolated enum TranscriptIndex {
       recording TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       app_name TEXT,
+      app TEXT,
+      window_title TEXT,
+      bundle_id TEXT,
       recorded_at REAL,
       transcribed_at REAL NOT NULL,
       language TEXT,
@@ -61,6 +64,24 @@ nonisolated enum TranscriptIndex {
       INSERT INTO segments_fts(segments_fts, rowid, text) VALUES('delete', old.id, old.text);
     END;
     """
+
+  /// What `PRAGMA user_version` is stamped with. `blackbox-mcp` refuses any other value,
+  /// so bump both together.
+  static let schemaVersion = 2
+
+  /// v1 -> v2 added `app`, `window_title` and `bundle_id`. The table is derived data, so
+  /// the migration only has to make the next `backfill` rewrite every row from its sidecar:
+  /// zeroing `source_mtime` marks them all stale, and the old `config_json` is preserved
+  /// by `write` for transcripts that predate the config being stored in `transcript.json`.
+  private static func migrate(_ db: OpaquePointer) throws {
+    var version = 0
+    try query(db, "PRAGMA user_version", []) { version = Int(sqlite3_column_int64($0, 0)) }
+    guard version == 1 else { return }
+    for column in ["app", "window_title", "bundle_id"] {
+      try exec(db, "ALTER TABLE transcripts ADD COLUMN \(column) TEXT", [])
+    }
+    try exec(db, "UPDATE transcripts SET source_mtime = 0", [])
+  }
 
   // MARK: - Public API
 
@@ -102,11 +123,21 @@ nonisolated enum TranscriptIndex {
       in: recordingDirectory.deletingLastPathComponent()
     ) { db in
       let metadata = RecordingMetadata.load(in: recordingDirectory)
+      // `app`, `window_title` and `bundle_id` are derived from `app_name` and the bundle id, so
+      // they move with it. A metadata file that was missing or corrupt and got rebuilt by a
+      // rename carries a different app name and no bundle id; updating only `app_name` left the
+      // structured fields describing a meeting the row no longer names.
+      let naming = metadata.map { RecordingNaming.split($0.appName) }
       try exec(
-        db, "UPDATE transcripts SET title = ?, app_name = ?, speakers_json = ? WHERE recording = ?",
+        db,
+        """
+        UPDATE transcripts SET title = ?, app_name = ?, app = ?, window_title = ?, bundle_id = ?,
+          speakers_json = ? WHERE recording = ?
+        """,
         [
           metadata?.title ?? recordingDirectory.lastPathComponent, metadata?.appName,
-          speakersJSON(metadata), recordingDirectory.lastPathComponent,
+          naming?.app, naming?.windowTitle, metadata?.perAppBundleID, speakersJSON(metadata),
+          recordingDirectory.lastPathComponent,
         ])
     }
   }
@@ -178,10 +209,18 @@ nonisolated enum TranscriptIndex {
   ) throws {
     let name = recordingDirectory.lastPathComponent
     let metadata = RecordingMetadata.load(in: recordingDirectory)
-    let configJSON = config.flatMap { try? JSONEncoder().encode($0) }
+    var configJSON = config.flatMap { try? JSONEncoder().encode($0) }
       .flatMap { String(data: $0, encoding: .utf8) }
+    let naming = metadata.map { RecordingNaming.split($0.appName) }
     try exec(db, "BEGIN IMMEDIATE", [])
     do {
+      // A transcript written before its config was stored in `transcript.json` has none to
+      // offer on a rebuild; keep what the row already had rather than nulling it.
+      if configJSON == nil {
+        try query(db, "SELECT config_json FROM transcripts WHERE recording = ?", [name]) {
+          configJSON = sqlite3_column_text($0, 0).map { String(cString: $0) }
+        }
+      }
       // Delete-then-insert rather than REPLACE: the cascade and the FTS delete
       // trigger only fire on a real DELETE, and a stale tail of segments from a
       // longer previous transcript must not survive a re-transcribe.
@@ -189,13 +228,15 @@ nonisolated enum TranscriptIndex {
       try exec(
         db,
         """
-        INSERT INTO transcripts(recording, title, app_name, recorded_at, transcribed_at, language,
-          provider, model, config_json, speakers_json, source_mtime)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transcripts(recording, title, app_name, app, window_title, bundle_id,
+          recorded_at, transcribed_at, language, provider, model, config_json, speakers_json,
+          source_mtime)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
-          name, metadata?.title ?? name, metadata?.appName,
-          metadata?.createdAt.timeIntervalSince1970, document.createdAt.timeIntervalSince1970,
+          name, metadata?.title ?? name, metadata?.appName, naming?.app, naming?.windowTitle,
+          metadata?.perAppBundleID, metadata?.createdAt.timeIntervalSince1970,
+          document.createdAt.timeIntervalSince1970,
           document.language, document.provider, document.model, configJSON,
           speakersJSON(metadata), sourceMTime,
         ])
@@ -247,13 +288,36 @@ nonisolated enum TranscriptIndex {
     do {
       try exec(db, "PRAGMA journal_mode = WAL", [])
       try exec(db, "PRAGMA foreign_keys = ON", [])
-      var error: UnsafeMutablePointer<CChar>?
-      guard sqlite3_exec(db, schema, nil, nil, &error) == SQLITE_OK else {
-        let message = error.map { String(cString: $0) } ?? "unknown"
-        sqlite3_free(error)
-        throw SQLiteError(description: message)
+      var current = -1
+      try query(db, "PRAGMA user_version", []) { current = Int(sqlite3_column_int64($0, 0)) }
+      // A newer build already owns this database. Stamping it back to this build's version would
+      // let the bundled MCP server query a schema it does not understand, and the newer build's
+      // own migration would then run against tables it already migrated. Leave it untouched.
+      if current > schemaVersion {
+        throw SQLiteError(
+          description:
+            "transcript index is schema v\(current), newer than the v\(schemaVersion) this build understands; leaving it untouched"
+        )
       }
-      try exec(db, "PRAGMA user_version = 1", [])
+      if current != schemaVersion {
+        // One transaction for migrate + DDL + the version stamp: a reader (the MCP server)
+        // must never see the tables without the version, which reads as "not ready".
+        try exec(db, "BEGIN IMMEDIATE", [])
+        do {
+          try migrate(db)
+          var error: UnsafeMutablePointer<CChar>?
+          guard sqlite3_exec(db, schema, nil, nil, &error) == SQLITE_OK else {
+            let message = error.map { String(cString: $0) } ?? "unknown"
+            sqlite3_free(error)
+            throw SQLiteError(description: message)
+          }
+          try exec(db, "PRAGMA user_version = \(schemaVersion)", [])
+          try exec(db, "COMMIT", [])
+        } catch {
+          try? exec(db, "ROLLBACK", [])
+          throw error
+        }
+      }
       try body(db)
     } catch {
       Log.error(Log.transcription, "index", "\(label) failed: \(error)")
