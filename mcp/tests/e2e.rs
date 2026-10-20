@@ -38,12 +38,16 @@ fn fixture(dir: &Path) -> PathBuf {
     db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
         .unwrap();
     db.execute_batch(&app_schema()).unwrap();
-    db.execute_batch("PRAGMA user_version = 1").unwrap();
-    for (name, title, app, at, lang, speakers) in [
+    db.execute_batch("PRAGMA user_version = 2").unwrap();
+    // (recording, title, app, window/tab title, bundle id, start, language, speakers)
+    #[allow(clippy::type_complexity)]
+    let recordings: [(&str, &str, &str, &str, &str, f64, &str, Option<&str>); 2] = [
         (
             "2610-20-zoom",
             "Планёрка",
             "Zoom",
+            "Планёрка команды",
+            "us.zoom.xos",
             DAY1,
             "ru",
             Some(r#"{"1":"Anna"}"#),
@@ -51,16 +55,21 @@ fn fixture(dir: &Path) -> PathBuf {
         (
             "2610-21-meet",
             "Design sync",
-            "Google Meet",
+            "Google Chrome",
+            "Design sync | Meet",
+            "com.google.Chrome",
             DAY2,
             "en",
             None,
         ),
-    ] {
+    ];
+    for (name, title, app, window, bundle, at, lang, speakers) in recordings {
+        // How the recorder joins them (`RecordingNaming.compose`).
+        let app_name = format!("{app} — {window}");
         db.execute(
-            "INSERT INTO transcripts(recording, title, app_name, recorded_at, transcribed_at, language, provider, model, speakers_json, source_mtime)
-             VALUES (?, ?, ?, ?, ?, ?, 'soniox', 'stt-async-v4', ?, 0)",
-            rusqlite::params![name, title, app, at, at + 600.0, lang, speakers],
+            "INSERT INTO transcripts(recording, title, app_name, app, window_title, bundle_id, recorded_at, transcribed_at, language, provider, model, speakers_json, source_mtime)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'soniox', 'stt-async-v4', ?, 0)",
+            rusqlite::params![name, title, app_name, app, window, bundle, at, at + 600.0, lang, speakers],
         )
         .unwrap();
     }
@@ -223,7 +232,7 @@ fn search_finds_inflections_labels_speakers_and_highlights() {
     let hits = r["hits"].as_array().unwrap();
     assert!(hits.iter().all(|h| h["recording"] == "2610-20-zoom"
         && h["title"] == "Планёрка"
-        && h["app"] == "Zoom"));
+        && h["meeting"]["app"] == "Zoom"));
     assert!(
         hits.iter()
             .any(|h| h["idx"] == 0 && h["speaker"] == "Я" && h["time"] == "00:00")
@@ -251,6 +260,12 @@ fn search_finds_inflections_labels_speakers_and_highlights() {
         json!({"query": "release", "app": "meet"}),
     );
     assert_eq!(en["hits"][0]["recording"], json!("2610-21-meet"));
+    // The tab title is searchable through `app` too, not just the app name.
+    let tab = s.tool(
+        "search_transcripts",
+        json!({"query": "release", "app": "design sync"}),
+    );
+    assert_eq!(tab["hits"][0]["recording"], json!("2610-21-meet"));
     let none = s.tool(
         "search_transcripts",
         json!({"query": "релиз", "since": "2030-01-01"}),
@@ -273,6 +288,49 @@ fn search_finds_inflections_labels_speakers_and_highlights() {
 }
 
 #[test]
+fn every_tool_says_which_meeting_it_was_by_app_tab_and_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = StdioClient::start(&fixture(dir.path()));
+
+    let want = |m: &Value, app: &str, window: &str, bundle: &str| {
+        assert_eq!(m["app"], json!(app), "{m}");
+        assert_eq!(m["window_title"], json!(window), "{m}");
+        assert_eq!(m["bundle_id"], json!(bundle), "{m}");
+        // Local-time ISO 8601 with an offset; the fixture's instants fall on 20/21 October.
+        assert!(
+            m["started_at"].as_str().unwrap().starts_with("2026-10-2"),
+            "{m}"
+        );
+    };
+    let hit = &s.tool("search_transcripts", json!({"query": "release"}))["hits"][0]["meeting"];
+    want(
+        hit,
+        "Google Chrome",
+        "Design sync | Meet",
+        "com.google.Chrome",
+    );
+
+    let list = s.tool("list_recordings", json!({}));
+    want(
+        &list["recordings"][0]["meeting"],
+        "Google Chrome",
+        "Design sync | Meet",
+        "com.google.Chrome",
+    );
+    let zoom = &list["recordings"][1]["meeting"];
+    want(zoom, "Zoom", "Планёрка команды", "us.zoom.xos");
+    // The end is the start plus how far the transcript runs.
+    assert!(zoom["ended_at_approx"].as_str().unwrap() > zoom["started_at"].as_str().unwrap());
+
+    let t = s.tool(
+        "get_transcript",
+        json!({"recording": "2610-20-zoom", "limit": 1}),
+    );
+    want(&t["meeting"], "Zoom", "Планёрка команды", "us.zoom.xos");
+    assert_eq!(t["meeting"]["duration"], json!("1:02:07"));
+}
+
+#[test]
 fn list_and_read_recordings_with_paging() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = StdioClient::start(&fixture(dir.path()));
@@ -286,7 +344,7 @@ fn list_and_read_recordings_with_paging() {
     );
     let zoom = &list["recordings"][1];
     assert_eq!(zoom["segments"], json!(4));
-    assert_eq!(zoom["duration"], json!("1:02:07"));
+    assert_eq!(zoom["meeting"]["duration"], json!("1:02:07"));
     assert_eq!(
         s.tool("list_recordings", json!({"title_contains": "ПЛАНЁР"}))["total"],
         json!(1)
@@ -329,6 +387,16 @@ fn list_and_read_recordings_with_paging() {
     assert_eq!(window["returned"], json!(2));
 
     let status = s.tool("index_status", json!({}));
+    let apps: Vec<&str> = status["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["app"].as_str().unwrap())
+        .collect();
+    assert!(
+        apps.contains(&"Zoom") && apps.contains(&"Google Chrome"),
+        "{apps:?}"
+    );
     assert_eq!(
         (status["recordings"].clone(), status["segments"].clone()),
         (json!(2), json!(5))
@@ -431,7 +499,7 @@ fn refuses_a_schema_version_it_was_not_written_for() {
     let db = fixture(dir.path());
     Connection::open(&db)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 2")
+        .execute_batch("PRAGMA user_version = 3")
         .unwrap();
     let mut s = StdioClient::start(&db);
     let reply = s.call(
@@ -443,7 +511,7 @@ fn refuses_a_schema_version_it_was_not_written_for() {
         reply["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("schema is v2")
+            .contains("schema is v3")
     );
 }
 

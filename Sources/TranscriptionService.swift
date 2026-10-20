@@ -72,6 +72,27 @@ nonisolated struct RecordingMetadata: Codable, Sendable {
   }
 }
 
+// MARK: - Recording Names
+
+/// How a recording's calling app and its window title are joined into one name
+/// (`"Google Chrome — Weekly sync | Meet"`) and read back apart. One definition for the
+/// recorder that joins them and the transcript index that splits them, so the two
+/// cannot drift: the title is the only record of *which tab* the call was in.
+nonisolated enum RecordingNaming {
+  static let windowTitleSeparator = " — "
+
+  static func compose(app: String, windowTitle: String) -> String {
+    "\(app)\(windowTitleSeparator)\(windowTitle)"
+  }
+
+  /// Splits at the first separator, so a window title that itself contains one stays whole.
+  static func split(_ appName: String) -> (app: String, windowTitle: String?) {
+    guard let range = appName.range(of: windowTitleSeparator) else { return (appName, nil) }
+    let title = appName[range.upperBound...].trimmingCharacters(in: .whitespaces)
+    return (String(appName[..<range.lowerBound]), title.isEmpty ? nil : title)
+  }
+}
+
 // MARK: - Track Roles
 
 /// What a given audio track inside `audio.m4a` carries.

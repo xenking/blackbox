@@ -14,7 +14,7 @@ use rusqlite::{Connection, OpenFlags, ToSql, functions::FunctionFlags, types::Va
 use serde_json::{Map, Value, json};
 
 /// `PRAGMA user_version` the app stamps on the index (`TranscriptIndex.schema`).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const APP_BUNDLE_ID: &str = "com.tenequm.Blackbox";
 pub const DB_FILE: &str = "transcripts.sqlite";
 
@@ -302,6 +302,21 @@ pub fn speaker_label(speaker: i64, names: &Value) -> String {
     } else {
         format!("Speaker {}", speaker.saturating_add(1))
     }
+}
+
+/// The "which meeting was this" fields, identical in every tool's output: the bare app, the
+/// window or browser-tab title it was in, the bundle id, and when it started and (roughly) ended.
+/// `end` is the start of the last spoken segment's end - the recording's audio may run a little longer.
+pub fn meeting(row: &Value, duration_sec: Option<f64>) -> Value {
+    let recorded = row["recorded_at"].as_f64();
+    json!({
+        "app": row["app"].as_str().or(row["app_name"].as_str()),
+        "window_title": row["window_title"],
+        "bundle_id": row["bundle_id"],
+        "started_at": recorded.map(iso),
+        "ended_at_approx": recorded.zip(duration_sec).map(|(start, d)| iso(start + d)),
+        "duration": duration_sec.map(clock),
+    })
 }
 
 pub fn clamp_limit(requested: Option<i64>, default: i64, max: i64) -> i64 {

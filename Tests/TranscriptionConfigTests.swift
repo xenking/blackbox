@@ -262,4 +262,111 @@ struct TranscriptIndexTests {
 
     #expect(try rows(old, "SELECT recording FROM transcripts") == [["stayed"]])
   }
+
+  // MARK: - Meeting metadata and schema v2
+
+  @Test("the app, the window or tab title and the bundle id are stored separately")
+  func meetingMetadataIsStructured() async throws {
+    let root = try makeRoot()
+    let directory = root.appendingPathComponent("2610-20-meet")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try RecordingMetadata(
+      title: "Standup", createdAt: Date(timeIntervalSince1970: 1_792_490_400),
+      appName: RecordingNaming.compose(app: "Google Chrome", windowTitle: "Weekly — sync | Meet"),
+      speakers: [:], perAppBundleID: "com.google.Chrome"
+    ).save(in: directory)
+    await TranscriptIndex.upsert(
+      recordingDirectory: directory, document: document(["hi"]), config: nil)
+
+    #expect(
+      try rows(root, "SELECT app, window_title, bundle_id, recorded_at FROM transcripts")
+        == [["Google Chrome", "Weekly — sync | Meet", "com.google.Chrome", "1792490400.0"]])
+  }
+
+  @Test("an app name with no window title has none, and the separator splits only once")
+  func namingRoundTrip() {
+    #expect(RecordingNaming.split("SonoBus").windowTitle == nil)
+    #expect(RecordingNaming.split("SonoBus").app == "SonoBus")
+    let composed = RecordingNaming.compose(app: "Arc", windowTitle: "A — B")
+    let split = RecordingNaming.split(composed)
+    #expect(split.app == "Arc" && split.windowTitle == "A — B")
+    #expect(RecordingNaming.split("Arc — ").windowTitle == nil)
+  }
+
+  /// A database the previous build created (schema v1) must keep working: the new columns
+  /// are added, every row is rewritten from its sidecar at the next backfill, and the
+  /// config the old row held survives for a transcript that never stored one.
+  @Test("a v1 index migrates to v2 and is repopulated from the transcripts")
+  func migratesFromV1() async throws {
+    let root = try makeRoot()
+    let directory = try makeRecording(in: root, "a", title: "Call")
+    try document(["old text"]).save(for: directory)
+
+    var db: OpaquePointer?
+    #expect(sqlite3_open(TranscriptIndex.databaseURL(in: root).path, &db) == SQLITE_OK)
+    let v1 = """
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE transcripts(recording TEXT PRIMARY KEY, title TEXT NOT NULL, app_name TEXT,
+        recorded_at REAL, transcribed_at REAL NOT NULL, language TEXT, provider TEXT, model TEXT,
+        config_json TEXT, speakers_json TEXT, source_mtime REAL NOT NULL);
+      CREATE TABLE segments(id INTEGER PRIMARY KEY,
+        recording TEXT NOT NULL REFERENCES transcripts(recording) ON DELETE CASCADE,
+        idx INTEGER NOT NULL, speaker INTEGER NOT NULL, start REAL NOT NULL, end REAL,
+        text TEXT NOT NULL, UNIQUE(recording, idx));
+      CREATE VIRTUAL TABLE segments_fts USING fts5(text, content='segments', content_rowid='id',
+        tokenize='unicode61 remove_diacritics 2');
+      CREATE TRIGGER segments_ai AFTER INSERT ON segments BEGIN
+        INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text); END;
+      CREATE TRIGGER segments_ad AFTER DELETE ON segments BEGIN
+        INSERT INTO segments_fts(segments_fts, rowid, text) VALUES('delete', old.id, old.text); END;
+      INSERT INTO transcripts VALUES('a','Call','Zoom',1,2,'ru',NULL,NULL,'{"languageHints":["ru"]}',
+        NULL, 4102444800);
+      PRAGMA user_version = 1;
+      """
+    #expect(sqlite3_exec(db, v1, nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(db)
+
+    await TranscriptIndex.backfill(in: root)
+
+    #expect(try rows(root, "PRAGMA user_version") == [["2"]])
+    #expect(
+      try rows(root, "SELECT app, config_json FROM transcripts") == [
+        ["Zoom", #"{"languageHints":["ru"]}"#]
+      ])
+    #expect(try rows(root, "SELECT text FROM segments") == [["old text"]])
+  }
+
+  /// The invariant an agent relies on: whatever was transcribed is findable.
+  @Test("every segment of every transcript is in the index and searchable")
+  func indexIsComplete() async throws {
+    let root = try makeRoot()
+    var expectedSegments = 0
+    for n in 0..<25 {
+      let directory = try makeRecording(
+        in: root, "rec-\(String(format: "%02d", n))", title: "Meeting \(n)")
+      let texts = (0..<(3 + n % 7)).map { "unique\(n)x\($0) общая фраза" }
+      expectedSegments += texts.count
+      try document(texts).save(for: directory)
+    }
+
+    await TranscriptIndex.backfill(in: root)
+
+    #expect(try rows(root, "SELECT count(*) FROM transcripts") == [["25"]])
+    #expect(try rows(root, "SELECT count(*) FROM segments") == [["\(expectedSegments)"]])
+    #expect(
+      try rows(root, "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'общая'") == [
+        ["\(expectedSegments)"]
+      ])
+    // Every recording is reachable by a word only it contains.
+    for n in 0..<25 {
+      let hit = try rows(
+        root,
+        "SELECT s.recording FROM segments_fts f JOIN segments s ON s.id = f.rowid WHERE segments_fts MATCH 'unique\(n)x0'"
+      )
+      #expect(hit == [["rec-\(String(format: "%02d", n))"]])
+    }
+    // A second backfill changes nothing and costs no rewrites.
+    await TranscriptIndex.backfill(in: root)
+    #expect(try rows(root, "SELECT count(*) FROM segments") == [["\(expectedSegments)"]])
+  }
 }

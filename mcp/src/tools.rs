@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::store::{
-    Store, StoreError, bad, clamp_limit, clock, fts, iso, one, parse_time, path_str, query,
-    speaker_label,
+    Store, StoreError, bad, clamp_limit, clock, fts, iso, meeting, one, parse_time, path_str,
+    query, speaker_label,
 };
 
 type ToolResult = Result<CallToolResult, ErrorData>;
@@ -46,7 +46,7 @@ struct SearchTranscripts {
     since: Option<String>,
     /// Only recordings made through this date/time (a bare date includes that whole day).
     until: Option<String>,
-    /// Case-insensitive substring of the app the call ran in, e.g. "zoom" or "meet".
+    /// Case-insensitive substring of the app OR the window/browser-tab title the call ran in, e.g. "zoom", "meet" or "weekly sync".
     app: Option<String>,
     /// Restrict to one recording id (the `recording` value from list_recordings).
     recording: Option<String>,
@@ -65,10 +65,11 @@ struct ListRecordings {
     since: Option<String>,
     /// Only recordings made through this date/time (a bare date includes that whole day).
     until: Option<String>,
-    /// Case-insensitive substring of the app name.
+    /// Case-insensitive substring of the app OR the window/browser-tab title, e.g. "chrome" or "standup".
     app: Option<String>,
     /// Case-insensitive substring of the recording title.
     title_contains: Option<String>,
+    /// Transcript language code, e.g. "ru".
     language: Option<String>,
     /// Max rows (default 30, max 200).
     limit: Option<i64>,
@@ -183,6 +184,7 @@ impl Server {
             .unwrap_or(Value::Null);
             let segments = one(c, "SELECT count(*) AS n FROM segments", &[])?.map(|r| r["n"].clone());
             let languages = query(c, "SELECT language, count(*) AS recordings FROM transcripts GROUP BY 1 ORDER BY 2 DESC", &[])?;
+            let apps = query(c, "SELECT coalesce(app, app_name) AS app, count(*) AS recordings FROM transcripts GROUP BY 1 ORDER BY 2 DESC LIMIT 20", &[])?;
             let models = query(c, "SELECT coalesce(provider,'') || ' ' || coalesce(model,'') AS model, count(*) AS recordings FROM transcripts GROUP BY 1 ORDER BY 2 DESC", &[])?;
             Ok(json!({
                 "database": path_str(&path),
@@ -192,6 +194,7 @@ impl Server {
                 "newest_recording": range["newest"].as_f64().map(iso),
                 "last_transcribed": range["last_transcribed"].as_f64().map(iso),
                 "languages": languages,
+                "apps": apps,
                 "models": models,
                 "speaker_labels": "Я = the local microphone (the user); others are named by the user or 'Speaker N'",
             }))
@@ -199,7 +202,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Full-text search across all transcripts (ranked). Returns segment hits with recording id, title, app, date, position (idx and mm:ss), speaker and a highlighted snippet. Filters: date range, app, one recording, speaker (me/others/id), language. Follow up with get_transcript (from_idx = idx - 3) for context."
+        description = "Full-text search across all transcripts (ranked). Returns segment hits with recording id, title, `meeting` (app, window/browser-tab title, bundle id, start time), position (idx and mm:ss), speaker and a highlighted snippet. Filters: date range, app, one recording, speaker (me/others/id), language. Follow up with get_transcript (from_idx = idx - 3) for context."
     )]
     fn search_transcripts(&self, Parameters(p): Parameters<SearchTranscripts>) -> ToolResult {
         let q = fts(&p.query, p.mode.as_deref())?;
@@ -229,7 +232,7 @@ impl Server {
             let rows = query(
                 c,
                 &format!(
-                    "SELECT s.recording, t.title, t.app_name, t.recorded_at, t.language, t.speakers_json, s.idx, s.speaker, s.start, s.text,
+                    "SELECT s.recording, t.title, t.app_name, t.app, t.window_title, t.bundle_id, t.recorded_at, t.language, t.speakers_json, s.idx, s.speaker, s.start, s.text,
                             snippet(segments_fts, 0, '[', ']', '…', 24) AS snippet
                      {from} WHERE {filter} ORDER BY bm25(segments_fts), t.recorded_at DESC, s.idx LIMIT :n"
                 ),
@@ -240,8 +243,9 @@ impl Server {
                 .map(|r| {
                     let names = r["speakers_json"].as_str().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
                     json!({
-                        "recording": r["recording"], "title": r["title"], "app": r["app_name"],
-                        "recorded_at": r["recorded_at"].as_f64().map(iso), "language": r["language"],
+                        "recording": r["recording"], "title": r["title"],
+                        "meeting": meeting(&r, None), "recorded_at": r["recorded_at"].as_f64().map(iso),
+                        "language": r["language"],
                         "idx": r["idx"], "time": clock(r["start"].as_f64().unwrap_or(0.0)),
                         "speaker": speaker_label(r["speaker"].as_i64().unwrap_or(0), &names),
                         "text": r["text"], "snippet": r["snippet"],
@@ -253,7 +257,7 @@ impl Server {
     }
 
     #[tool(
-        description = "List transcribed recordings, newest first, with title, app, date, language, segment count and duration. Filters: date range, app, title text, language. Use the `recording` id with get_transcript or search_transcripts."
+        description = "List transcribed recordings, newest first, each with title, `meeting` (app, window/browser-tab title, bundle id, start time, approximate end, duration), language and segment count. Filters: date range, app or tab text, title text, language. Use the `recording` id with get_transcript or search_transcripts."
     )]
     fn list_recordings(&self, Parameters(p): Parameters<ListRecordings>) -> ToolResult {
         let (since, until) = time_bounds(&p.since, &p.until)?;
@@ -277,7 +281,7 @@ impl Server {
             let rows = query(
                 c,
                 &format!(
-                    "SELECT t.recording, t.title, t.app_name AS app, t.recorded_at, t.transcribed_at, t.language, t.model,
+                    "SELECT t.recording, t.title, t.app_name, t.app, t.window_title, t.bundle_id, t.recorded_at, t.transcribed_at, t.language, t.model,
                             (SELECT count(*) FROM segments s WHERE s.recording = t.recording) AS segments,
                             (SELECT max(coalesce(s.end, s.start)) FROM segments s WHERE s.recording = t.recording) AS duration_sec
                      FROM transcripts t WHERE {filter} ORDER BY t.recorded_at DESC, t.recording DESC LIMIT :n OFFSET :offset"
@@ -286,11 +290,13 @@ impl Server {
             )?;
             let rows: Vec<Value> = rows
                 .into_iter()
-                .map(|mut r| {
-                    r["recorded_at"] = r["recorded_at"].as_f64().map(iso).into();
-                    r["transcribed_at"] = r["transcribed_at"].as_f64().map(iso).into();
-                    r["duration"] = r["duration_sec"].as_f64().map(clock).into();
-                    r
+                .map(|r| {
+                    json!({
+                        "recording": r["recording"], "title": r["title"],
+                        "meeting": meeting(&r, r["duration_sec"].as_f64()),
+                        "transcribed_at": r["transcribed_at"].as_f64().map(iso),
+                        "language": r["language"], "model": r["model"], "segments": r["segments"],
+                    })
                 })
                 .collect();
             Ok(json!({ "total": total, "returned": rows.len(), "offset": offset, "recordings": rows }))
@@ -307,7 +313,7 @@ impl Server {
         self.with(|c| {
             let Some(t) = one(
                 c,
-                "SELECT recording, title, app_name, recorded_at, transcribed_at, language, provider, model, speakers_json
+                "SELECT recording, title, app_name, app, window_title, bundle_id, recorded_at, transcribed_at, language, provider, model, speakers_json
                  FROM transcripts WHERE recording = :r",
                 &[(":r", &p.recording)],
             )?
@@ -316,6 +322,8 @@ impl Server {
             };
             let names: Value = t["speakers_json"].as_str().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
             let total = one(c, "SELECT count(*) AS n FROM segments WHERE recording = :r", &[(":r", &p.recording)])?.map(|r| r["n"].clone());
+            let duration = one(c, "SELECT max(coalesce(end, start)) AS d FROM segments WHERE recording = :r", &[(":r", &p.recording)])?
+                .and_then(|r| r["d"].as_f64());
             let fetch = n + 1;
             let rows = query(
                 c,
@@ -341,8 +349,8 @@ impl Server {
                 returned += 1;
             }
             Ok(json!({
-                "recording": t["recording"], "title": t["title"], "app": t["app_name"],
-                "recorded_at": t["recorded_at"].as_f64().map(iso), "transcribed_at": t["transcribed_at"].as_f64().map(iso),
+                "recording": t["recording"], "title": t["title"],
+                "meeting": meeting(&t, duration), "transcribed_at": t["transcribed_at"].as_f64().map(iso),
                 "language": t["language"], "provider": t["provider"], "model": t["model"], "speakers": names,
                 "total_segments": total, "from_idx": from, "returned": returned, "next_idx": next_idx,
                 "transcript": text,

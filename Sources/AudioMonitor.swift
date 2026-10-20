@@ -582,7 +582,7 @@ final class AudioMonitor {
         return meetingKeywords.contains { lower.contains($0) }
       } ?? titles.first
     guard let picked, picked != appName else { return appName }
-    return "\(appName) — \(picked.prefix(80))"
+    return RecordingNaming.compose(app: appName, windowTitle: String(picked.prefix(80)))
   }
 
   /// First currently-active caller resolved to its parent bundle ID. Used by

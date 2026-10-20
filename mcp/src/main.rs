@@ -172,24 +172,34 @@ fn print_config(show_token: bool) -> anyhow::Result<()> {
             "# The HTTP agent is not installed: run `blackbox-mcp install-agent` first (stdio below works without it).\n"
         );
     }
+    let bearer_cmd = if show_token {
+        bearer.clone()
+    } else {
+        format!("$(cat '{token_file}')")
+    };
     println!(
-        "# stdio - no network, no token; the client starts the server itself\n[mcp_servers.blackbox]\ncommand = \"{}\"\nargs = [\"stdio\"]\n",
+        "# ===== Codex (~/.codex/config.toml - the Codex app and the CLI share it) =====
+# A server has either `command` or `url`, never both: use ONE of these two blocks.
+#
+# A) stdio. Recommended for the Codex app: no network listener, no token, and no
+#    environment to arrange (a GUI app does not inherit your shell's variables).
+[mcp_servers.blackbox]
+command = \"{}\"
+args = [\"stdio\"]
+
+# B) the always-on HTTP agent. Replace block A with this, and make BLACKBOX_MCP_TOKEN
+#    visible to Codex: export BLACKBOX_MCP_TOKEN=$(cat '{token_file}')
+# [mcp_servers.blackbox]
+# url = \"{url}\"
+# bearer_token_env_var = \"BLACKBOX_MCP_TOKEN\"",
         binary.display()
     );
-    println!("# HTTP - the always-on LaunchAgent. Token file: {token_file} (mode 0600)");
     println!(
-        "claude mcp add --transport http blackbox {url} --header \"Authorization: Bearer {}\"",
-        if show_token {
-            bearer.clone()
-        } else {
-            format!("$(cat '{token_file}')")
-        }
+        "\n# ===== Claude Code (HTTP agent; token file {token_file}, mode 0600) =====\nclaude mcp add --transport http blackbox {url} --header \"Authorization: Bearer {bearer_cmd}\"\n# or stdio: claude mcp add blackbox -- {} stdio",
+        binary.display()
     );
     println!(
-        "\n# Codex ~/.codex/config.toml (export BLACKBOX_MCP_TOKEN=$(cat '{token_file}'))\n[mcp_servers.blackbox]\nurl = \"{url}\"\nbearer_token_env_var = \"BLACKBOX_MCP_TOKEN\""
-    );
-    println!(
-        "\n# Generic mcp.json\n{{ \"mcpServers\": {{ \"blackbox\": {{ \"type\": \"http\", \"url\": \"{url}\", \"headers\": {{ \"Authorization\": \"Bearer {bearer}\" }} }} }} }}"
+        "\n# ===== Generic mcp.json (HTTP agent) =====\n{{ \"mcpServers\": {{ \"blackbox\": {{ \"type\": \"http\", \"url\": \"{url}\", \"headers\": {{ \"Authorization\": \"Bearer {bearer}\" }} }} }} }}"
     );
     Ok(())
 }
