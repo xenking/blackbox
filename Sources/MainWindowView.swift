@@ -1870,10 +1870,25 @@ enum WaveformExtractor {
       !tracks.isEmpty,
       let reader = try? AVAssetReader(asset: asset)
     else { return [] }
-    return await Task.detached {
-      extractSync(tracks: tracks, reader: reader)
-    }.value
+    // `AVAssetTrack` and `AVAssetReader` are not Sendable; each is used by exactly one
+    // job, on exactly one thread, and never touched again by this task.
+    nonisolated(unsafe) let unsafeTracks = tracks
+    nonisolated(unsafe) let unsafeReader = reader
+    return await withCheckedContinuation { continuation in
+      workQueue.async {
+        continuation.resume(returning: extractSync(tracks: unsafeTracks, reader: unsafeReader))
+      }
+    }
   }
+
+  /// The decode loop blocks its thread for the whole recording (`copyNextSampleBuffer` is
+  /// synchronous), so it must not run on the Swift cooperative pool: AVAssetReader delivers
+  /// samples via libdispatch, and with every pool thread parked inside it - several recordings
+  /// opened in a row, or parallel tests - delivery never gets a thread and the reads deadlock.
+  /// Same trap as `AECProcessor.workQueue`. Concurrent so a long recording does not make a
+  /// short one wait behind it.
+  nonisolated private static let workQueue = DispatchQueue(
+    label: "com.tenequm.blackbox.waveform", qos: .userInitiated, attributes: .concurrent)
 
   nonisolated private static func extractSync(tracks: [AVAssetTrack], reader: AVAssetReader)
     -> [Float]
