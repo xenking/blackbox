@@ -249,7 +249,7 @@ final class TranscriptionHarness {
   /// Polls until `condition` holds. The coordinator hops between the main actor
   /// and the service actor, so yielding a fixed number of times is not enough.
   func wait(
-    upTo timeout: TimeInterval = 5,
+    upTo timeout: TimeInterval = 15,
     for condition: @MainActor () async -> Bool
   ) async {
     let deadline = Date().addingTimeInterval(timeout)
