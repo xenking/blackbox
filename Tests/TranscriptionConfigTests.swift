@@ -229,4 +229,37 @@ struct TranscriptIndexTests {
 
     #expect(RecordingStore.directories(in: root).map(\.lastPathComponent) == ["a"])
   }
+
+  @Test("moving the library rebuilds the index in the new folder and retires the old one")
+  func moveMigratesIndex() async throws {
+    let old = try makeRoot()
+    let new = try makeRoot()
+    let directory = try makeRecording(in: old, "a")
+    try document(["moved words"]).save(for: directory)
+    await TranscriptIndex.backfill(in: old)
+    #expect(FileManager.default.fileExists(atPath: TranscriptIndex.databaseURL(in: old).path))
+
+    try FileManager.default.moveItem(at: directory, to: new.appendingPathComponent("a"))
+    await TranscriptIndex.backfill(in: new)
+    TranscriptIndex.removeDatabase(in: old)
+
+    #expect(try rows(new, "SELECT text FROM segments") == [["moved words"]])
+    #expect(!FileManager.default.fileExists(atPath: TranscriptIndex.databaseURL(in: old).path))
+  }
+
+  @Test("a partial move prunes the old index down to what stayed behind")
+  func partialMovePrunesOldIndex() async throws {
+    let old = try makeRoot()
+    let new = try makeRoot()
+    let stayed = try makeRecording(in: old, "stayed")
+    let moved = try makeRecording(in: old, "moved")
+    try document(["stay"]).save(for: stayed)
+    try document(["go"]).save(for: moved)
+    await TranscriptIndex.backfill(in: old)
+
+    try FileManager.default.moveItem(at: moved, to: new.appendingPathComponent("moved"))
+    await TranscriptIndex.backfill(in: old)
+
+    #expect(try rows(old, "SELECT recording FROM transcripts") == [["stayed"]])
+  }
 }

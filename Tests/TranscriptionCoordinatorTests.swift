@@ -1596,6 +1596,26 @@ struct TranscriptionCoordinatorTests {
     #expect(Set(await harness.service.deletedFileIds) == ["file-1", "file-2"])
   }
 
+  /// The skipped part's uploaded file exists only on Soniox. If its delete fails,
+  /// the sidecar must still name it, or nothing ever will.
+  @Test("a skipped part's uploaded file stays named until its delete is confirmed")
+  func skippedUploadSurvivesFailedDelete() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setPlannedRoles([.mic, .farEnd])
+    await harness.service.setAfterCreate { @MainActor [harness] in harness.autoEnabled = false }
+    await harness.service.setDeleteSucceeds(false)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    await harness.wait { TranscriptionJob.load(for: directory)?.awaitingRemoteDelete == true }
+
+    let job = try #require(TranscriptionJob.load(for: directory))
+    #expect(job.fileIds.contains("file-2"))
+    #expect(job.fileIds.contains("file-1"))
+  }
+
   @Test("a job record that cannot be written stops the job before it bills")
   func unwritableRecordStopsBeforeBilling() async throws {
     let harness = try TranscriptionHarness()
@@ -1651,5 +1671,62 @@ struct TranscriptionCoordinatorTests {
     coordinator.recordingFinished(recordingDirectory: directory)
     await harness.wait { coordinator.status(for: directory) == .completed }
     #expect(await harness.service.uploadCount == 1)
+  }
+
+  @Test("quit landing during the last upload does not start a create")
+  func suspendedBeforeCreateDoesNotBill() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    await harness.service.setAfterUpload { @MainActor in coordinator.suspendNewJobs() }
+
+    coordinator.transcribe(recordingDirectory: directory)
+    try await Task.sleep(for: .milliseconds(200))
+
+    #expect(await harness.service.createCount == 0)
+    // Left for the next launch to resume, with the uploaded file still named.
+    #expect(TranscriptionJob.load(for: directory)?.fileIds == ["file-1"])
+  }
+
+  @Test("cancel landing during the last upload does not start a create")
+  func cancelledBeforeCreateDoesNotBill() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    await harness.service.setAfterUpload { @MainActor in
+      coordinator.cancel(recordingDirectory: directory)
+    }
+
+    coordinator.transcribe(recordingDirectory: directory)
+    try await Task.sleep(for: .milliseconds(200))
+
+    #expect(await harness.service.createCount == 0)
+  }
+
+  @Test("a reservation does not outlive the setting being turned off")
+  func reservationReleasedWhenConsentGone() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingPending(recordingDirectory: directory)
+    #expect(coordinator.hasActiveJobs)
+    harness.autoEnabled = false
+    coordinator.recordingFinished(recordingDirectory: directory)
+
+    #expect(!coordinator.hasActiveJobs)
+  }
+
+  @Test("a running job blocks moving the library")
+  func activeJobBlocksMove() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    #expect(!coordinator.hasActiveJobs)
+
+    coordinator.transcribe(recordingDirectory: directory)
+    #expect(coordinator.hasActiveJobs)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    await harness.wait { !coordinator.hasActiveJobs }
   }
 }

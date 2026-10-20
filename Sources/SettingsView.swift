@@ -702,6 +702,14 @@ struct SettingsView: View {
       actionError = "Recording in progress. Existing recordings were left where they are."
       return
     }
+    // A job keeps the directory path it started with: after a move its sidecar
+    // writes fail and the post-fetch existence check discards a transcript that
+    // is already paid for.
+    guard !transcription.hasActiveJobs else {
+      actionError =
+        "Transcription in progress. Existing recordings were left where they are - move them after it finishes."
+      return
+    }
     Task.detached {
       var failed: [String] = []
       for directory in RecordingStore.directories(in: source) {
@@ -716,6 +724,15 @@ struct SettingsView: View {
             Log.app, "settings",
             "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
         }
+      }
+      // The index is derived from the sidecars that just moved. Rebuild it in the
+      // new folder, and retire the old copy - or, when some recordings stayed
+      // behind, prune it down to just those.
+      await TranscriptIndex.backfill(in: destination)
+      if failed.isEmpty {
+        TranscriptIndex.removeDatabase(in: source)
+      } else {
+        await TranscriptIndex.backfill(in: source)
       }
       if !failed.isEmpty {
         let names = failed

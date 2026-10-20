@@ -153,6 +153,16 @@ nonisolated enum TranscriptIndex {
     }
   }
 
+  /// Deletes the database and its WAL/SHM files from a save folder. Used when
+  /// the library moves: the old copy still holds every transcript's text, and an
+  /// agent pointed at it would keep finding recordings the user moved away.
+  static func removeDatabase(in saveDirectory: URL) {
+    for suffix in ["", "-wal", "-shm"] {
+      try? FileManager.default.removeItem(
+        at: saveDirectory.appendingPathComponent(fileName + suffix))
+    }
+  }
+
   // MARK: - Writing
 
   private static func write(

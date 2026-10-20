@@ -373,6 +373,11 @@ final class TranscriptionCoordinator {
 
   func suspendNewJobs() { isSuspended = true }
 
+  /// Whether any job holds a recording directory, running or reserved for its
+  /// mixdown. Moving the save folder under one strands its sidecar writes and
+  /// discards an already-paid transcript.
+  var hasActiveJobs: Bool { !jobs.isEmpty || !reserved.isEmpty }
+
   @ObservationIgnored private let dependencies: Dependencies
   /// Outer nil means "not read yet". Cached because `hasAPIKey` is read from a
   /// SwiftUI body that re-evaluates at playback tick rate, and reading the key
@@ -451,7 +456,13 @@ final class TranscriptionCoordinator {
   /// next recording deduped against it, and `RecordingStore.audioURL(in:)`
   /// transcribed whatever stray audio happened to sit at the top level.
   func recordingFinished(recordingDirectory: URL) {
-    guard shouldAutoTranscribe(recordingDirectory) else { return }
+    guard shouldAutoTranscribe(recordingDirectory) else {
+      // Setting turned off (or the key removed) since `recordingPending`: the
+      // reservation must not outlive the decision, or it blocks moving the
+      // library forever. The sidecar stays; resume drops it as withdrawn.
+      reserved.remove(recordingDirectory.path)
+      return
+    }
     enqueue(recordingDirectory, isAutomatic: true)
   }
 
@@ -859,13 +870,22 @@ final class TranscriptionCoordinator {
               Log.transcription, "transcription",
               "auto-transcription turned off after \(job.transcriptionIds.count) billed part(s) for \(name); not billing the rest"
             )
-            // Their uploaded files are deleted rather than forgotten: once the
-            // parts leave the record nothing else names them.
-            discardRemote(
-              job: TranscriptionJob(parts: job.parts.filter { $0.transcriptionId == nil }))
-            job.parts.removeAll { $0.transcriptionId == nil }
-            try job.write(for: recordingDirectory)
+            // The unbilled parts stay in the record on purpose, with their
+            // uploaded file ids: the post-transcript cleanup deletes every id the
+            // record names and retires it only once Soniox confirms, so a delete
+            // that fails (offline, bad key) still has the ids to retry from.
+            // Dropping the parts here would overwrite the only record of them.
             break
+          }
+          // Re-checked here, not only at the gate: an upload can finish just as
+          // Cancel or quit lands, and this call is the one that bills. A create
+          // cut off by process exit loses its id and the next launch pays again.
+          try Task.checkCancellation()
+          guard !isSuspended else {
+            Log.info(
+              Log.transcription, "transcription",
+              "deferring \(name) to the next launch: quit began before billing")
+            return
           }
           guard let fileId = job.parts[index].fileId else {
             fail(&job, in: recordingDirectory, message: "Soniox returned no file id")

@@ -1079,7 +1079,9 @@ struct RecordingDetailView: View {
       seekTo(savedTime)
     }
     if wasPlaying {
-      player?.play()
+      // `rate`, as `togglePlayback` does: `play()` snaps the new player to 1x
+      // while the picker keeps showing the chosen speed.
+      player?.rate = Float(playbackRate)
       isPlaying = true
     }
     trackSelection = .all

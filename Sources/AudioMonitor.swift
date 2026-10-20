@@ -53,6 +53,15 @@ final class AudioMonitor {
   private var autoRestartWindowStart: Date?
   private var manualRestartCount = 0
   private var manualRestartWindowStart: Date?
+  // Display loss gets its own, looser budget: a display sleep is not a recorder
+  // fault and must not spend the budget above, but ScreenCaptureKit can also
+  // report it repeatedly while a display still enumerates, and every restart
+  // creates a recording on disk. 10 in 30s is far past any real sleep/wake.
+  private static let displayLostRestartLimit = 10
+  private var autoDisplayLostCount = 0
+  private var autoDisplayLostWindowStart: Date?
+  private var manualDisplayLostCount = 0
+  private var manualDisplayLostWindowStart: Date?
 
   private var micPollingTask: Task<Void, Never>?
   private var lastKnownMicRunning = false
@@ -235,6 +244,8 @@ final class AudioMonitor {
     if resetRestartBudget {
       manualRestartCount = 0
       manualRestartWindowStart = nil
+      manualDisplayLostCount = 0
+      manualDisplayLostWindowStart = nil
     }
 
     let useMic = micEnabled
@@ -320,11 +331,20 @@ final class AudioMonitor {
       setError("Recording stopped - not enough disk space")
       updateAutoState()
     case .displayLost:
-      // Display sleep, not a fault: restart unconditionally. start() waits for
-      // a display to come back, so this does not spin against the budget.
-      Log.info(Log.monitor, "monitor", "display lost during manual recording, restarting")
-      setError("Display slept - resuming recording...")
-      startManualRecording(resetRestartBudget: false)
+      // Display sleep, not a fault: it does not spend the systemStopped budget.
+      // start() waits for a display to come back, but not when one is still
+      // enumerated, so a separate bound stops a restart loop.
+      if shouldAllowRestart(
+        count: &manualDisplayLostCount, windowStart: &manualDisplayLostWindowStart,
+        max: Self.displayLostRestartLimit)
+      {
+        Log.info(Log.monitor, "monitor", "display lost during manual recording, restarting")
+        setError("Display slept - resuming recording...")
+        startManualRecording(resetRestartBudget: false)
+      } else {
+        Log.error(Log.monitor, "monitor", "manual recording display-loss restart limit exceeded")
+        setError("Recording failed repeatedly")
+      }
     case .systemStopped, .other:
       if shouldAllowRestart(
         count: &manualRestartCount, windowStart: &manualRestartWindowStart)
@@ -689,6 +709,8 @@ final class AudioMonitor {
     if resetRestartBudget {
       autoRestartCount = 0
       autoRestartWindowStart = nil
+      autoDisplayLostCount = 0
+      autoDisplayLostWindowStart = nil
     }
 
     let useMic = micEnabled
@@ -807,8 +829,19 @@ final class AudioMonitor {
       autoRecordingBundleID = nil
       updateAutoState()
     case .displayLost:
-      Log.info(Log.monitor, "monitor", "display lost during auto-recording, restarting")
-      startAutoRecording(resetRestartBudget: false)
+      if shouldAllowRestart(
+        count: &autoDisplayLostCount, windowStart: &autoDisplayLostWindowStart,
+        max: Self.displayLostRestartLimit)
+      {
+        Log.info(Log.monitor, "monitor", "display lost during auto-recording, restarting")
+        startAutoRecording(resetRestartBudget: false)
+      } else {
+        Log.error(Log.monitor, "monitor", "auto-recording display-loss restart limit exceeded")
+        setError("Recording failed repeatedly")
+        autoRecordingAppName = nil
+        autoRecordingBundleID = nil
+        updateAutoState()
+      }
     case .systemStopped:
       if shouldAllowRestart(
         count: &autoRestartCount, windowStart: &autoRestartWindowStart)

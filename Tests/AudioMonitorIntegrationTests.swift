@@ -160,6 +160,32 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("repeated display loss on a display that never goes away stops instead of looping")
+  func displayLostRestartLoopIsBounded() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    // The clock never advances, so every loss lands inside one 30s window.
+    for _ in 0..<12 {
+      guard let current = harness.recorderFactory.createdSessions.last, monitor.isRecording
+      else { break }
+      current.emitFailure(.displayLost)
+      await settle()
+    }
+
+    // 1 initial + at most 10 restarts, then it gives up and says so.
+    #expect(harness.recorderFactory.createdSessions.count == 11)
+    #expect(!monitor.isRecording)
+    #expect(monitor.errorMessage == "Recording failed repeatedly")
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("display loss restarts manual recording")
   func displayLostRestartsManualRecording() async throws {
     let harness = MonitorHarness()
