@@ -27,8 +27,7 @@ Sources/
   Log.swift                                - OSLog + file logging, debug export
 Info.plist                                 - LSUIElement, NSAudioCaptureUsageDescription, NSMicrophoneUsageDescription
 Makefile                                   - build, bundle, dmg, release, install, run, format, format-check, test, check, smoke, clean
-.github/workflows/ci.yml                   - CI on macos-26: lint, full test suite, release-please, DMG publish
-.github/workflows/release-note.yml         - Lints PR title + `## Release notes` section (they become the changelog)
+.github/workflows/                         - REMOVED in this fork: it has no Apple signing secrets, so upstream's CI could never pass here. `make check` is the gate; releases are built locally (`make dmg`)
 .github/actions/signed-bundle/             - Imports the Developer ID cert and builds a signed .app
 .github/actions/grant-recording/           - Seeds Screen Recording + Microphone into the TCC databases
 .github/cliff.toml                         - git-cliff config; owns CHANGELOG.md and the release body
@@ -107,6 +106,8 @@ The app supports `--ui-test-mode` for smoke tests. `BlackboxTestMode` parses CLI
 
 App logs: `~/Library/Logs/Blackbox/blackbox.log`
 Crash reports: `~/Library/Logs/DiagnosticReports/Retired/Blackbox-*.ips`
+
+> **Fork note:** this fork deleted `.github/workflows/`. The release pipeline below (release-please, notarization, Sparkle appcast, cask bump) describes upstream and does not run here; `.github/actions/` and the scripts are kept so upstream merges stay clean.
 
 ## Pre-Release Checklist
 

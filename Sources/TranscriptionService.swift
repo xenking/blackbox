@@ -187,6 +187,25 @@ nonisolated enum RecordingStore {
   /// Dotfiles are filtered here because the path-based enumeration has no
   /// equivalent of `.skipsHiddenFiles`, and without it every scan stats
   /// `.DS_Store` looking for a recording inside it.
+  /// The entries of `directories(in:)` that are actually recordings: a directory
+  /// holding at least one file Blackbox writes. Used before anything destructive
+  /// (moving the library), where "every visible entry" would sweep up unrelated
+  /// files if the save folder is a shared one.
+  static func recordingDirectories(in saveDirectory: URL) -> [URL] {
+    directories(in: saveDirectory).filter { url in
+      var isDirectory: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+        isDirectory.boolValue
+      else { return false }
+      let markers = [
+        url.appendingPathComponent(audioName), url.appendingPathComponent(processedAudioName),
+        url.appendingPathComponent(RecordingMetadata.fileName),
+        TranscriptDocument.sidecarURL(for: url), TranscriptionJob.url(for: url),
+      ]
+      return markers.contains { FileManager.default.fileExists(atPath: $0.path) }
+    }
+  }
+
   static func directories(in saveDirectory: URL) -> [URL] {
     guard let names = try? FileManager.default.contentsOfDirectory(atPath: saveDirectory.path)
     else { return [] }
@@ -212,16 +231,21 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
   /// something to label them with.
   var provider: String?
   var model: String?
+  /// What the request was run with (language hints, context, diarization). Kept
+  /// with the transcript so the SQLite index - a derived copy - can be rebuilt
+  /// complete after a move or a lost database, instead of losing it to a rebuild.
+  var config: TranscriptionConfig?
 
   init(
     segments: [TranscriptSegment], language: String? = nil, createdAt: Date,
-    provider: String? = nil, model: String? = nil
+    provider: String? = nil, model: String? = nil, config: TranscriptionConfig? = nil
   ) {
     self.segments = segments
     self.language = language
     self.createdAt = createdAt
     self.provider = provider
     self.model = model
+    self.config = config
   }
 
   /// Hand-written for the same reason as `RecordingMetadata`'s. Here the cost of
@@ -235,6 +259,7 @@ nonisolated struct TranscriptDocument: Codable, Sendable {
     createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     provider = try container.decodeIfPresent(String.self, forKey: .provider)
     model = try container.decodeIfPresent(String.self, forKey: .model)
+    config = try? container.decodeIfPresent(TranscriptionConfig.self, forKey: .config)
   }
 
   nonisolated static func sidecarURL(for recordingURL: URL) -> URL {
@@ -809,15 +834,28 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
   /// Removes mix and upload scratch files stranded by a quit mid-job. Each is
   /// the full size of a recording, and resume-after-quit makes that a routine
   /// path rather than a crash-only one.
+  ///
+  /// Only files older than `staleScratchAge`: a relaunch (the Setup Assistant
+  /// starts the new instance before the old one exits) runs this while the old
+  /// instance may still be mixing or uploading one of these, and the names carry
+  /// no owner. Fresh files are left for a later launch to collect.
+  static let staleScratchAge: TimeInterval = 6 * 3600
+
   @concurrent
-  static func sweepTemporaryFiles() async {
-    let temporaryDirectory = FileManager.default.temporaryDirectory
+  static func sweepTemporaryFiles(now: Date = Date(), in directory: URL? = nil) async {
+    let temporaryDirectory = directory ?? FileManager.default.temporaryDirectory
     guard
       let names = try? FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path)
     else { return }
     for name in names
     where name.hasPrefix(Self.mixPrefix) || name.hasPrefix(Self.uploadPrefix) {
-      try? FileManager.default.removeItem(at: temporaryDirectory.appendingPathComponent(name))
+      let url = temporaryDirectory.appendingPathComponent(name)
+      let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+        .contentModificationDate
+      // An unreadable date is treated as fresh: deleting something that may be live is the
+      // worse error.
+      guard let modified, now.timeIntervalSince(modified) > Self.staleScratchAge else { continue }
+      try? FileManager.default.removeItem(at: url)
     }
   }
 
@@ -831,16 +869,34 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     // `copyItem` throws on an existing file - so agreeing to replace produced a
     // "file exists" error and left the old file untouched.
     guard tracks.count >= 2 else {
-      try? FileManager.default.removeItem(at: outputURL)
-      try FileManager.default.copyItem(at: fileURL, to: outputURL)
+      try replaceItem(at: outputURL, withCopyOf: fileURL)
       return
     }
     // Reuses the already-loaded asset rather than re-parsing the container.
     let mixed = try await mix(
       asset: asset, tracks: tracks, map: trackMap(for: fileURL, trackCount: tracks.count))
     defer { try? FileManager.default.removeItem(at: mixed) }
-    try? FileManager.default.removeItem(at: outputURL)
-    try FileManager.default.copyItem(at: mixed, to: outputURL)
+    try replaceItem(at: outputURL, withCopyOf: mixed)
+  }
+
+  /// Copies beside the destination and swaps it in only once the copy is whole.
+  /// The old order - delete the existing file, then copy - destroyed the user's
+  /// previous export whenever the copy then failed (disk full, volume gone).
+  static func replaceItem(at outputURL: URL, withCopyOf source: URL) throws {
+    let fileManager = FileManager.default
+    let staging = outputURL.deletingLastPathComponent()
+      .appendingPathComponent(".\(outputURL.lastPathComponent).\(UUID().uuidString).partial")
+    try fileManager.copyItem(at: source, to: staging)
+    do {
+      if fileManager.fileExists(atPath: outputURL.path) {
+        _ = try fileManager.replaceItemAt(outputURL, withItemAt: staging)
+      } else {
+        try fileManager.moveItem(at: staging, to: outputURL)
+      }
+    } catch {
+      try? fileManager.removeItem(at: staging)
+      throw error
+    }
   }
 
   // MARK: - Upload

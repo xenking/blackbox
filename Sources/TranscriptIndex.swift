@@ -76,8 +76,8 @@ nonisolated enum TranscriptIndex {
       in: recordingDirectory.deletingLastPathComponent()
     ) { db in
       try write(
-        db, recordingDirectory: recordingDirectory, document: document, config: config,
-        sourceMTime: Date().timeIntervalSince1970)
+        db, recordingDirectory: recordingDirectory, document: document,
+        config: config ?? document.config, sourceMTime: Date().timeIntervalSince1970)
     }
   }
 
@@ -143,7 +143,9 @@ nonisolated enum TranscriptIndex {
         // re-transcribe rewrites it, and the live path indexes at write time.
         if let indexed = known[name], indexed >= mtime { continue }
         guard let document = TranscriptDocument.load(for: url) else { continue }
-        try write(db, recordingDirectory: url, document: document, config: nil, sourceMTime: mtime)
+        try write(
+          db, recordingDirectory: url, document: document, config: document.config,
+          sourceMTime: mtime)
       }
       // An unreadable folder lists as empty; pruning on that would wipe the
       // index, so rows are only dropped when the listing found something.

@@ -698,7 +698,12 @@ struct SettingsView: View {
   /// recorder captures its save directory when it starts, so it would keep
   /// writing to an inode with no name.
   private func moveRecordings(from source: URL, to destination: URL) {
+    // `pickFolder` already committed the destination. Every early return below
+    // has to put the source back: the recordings and any job sidecar stay there,
+    // and launch-time resume and `recordingFinished` only look at the current one.
+    let revert = { saveDirectoryPath = source.path(percentEncoded: false) }
     guard !monitor.isRecording, !monitor.isSaving else {
+      revert()
       actionError = "Recording in progress. Existing recordings were left where they are."
       return
     }
@@ -706,13 +711,16 @@ struct SettingsView: View {
     // writes fail and the post-fetch existence check discards a transcript that
     // is already paid for.
     guard !transcription.hasActiveJobs else {
+      revert()
       actionError =
         "Transcription in progress. Existing recordings were left where they are - move them after it finishes."
       return
     }
     Task.detached {
       var failed: [String] = []
-      for directory in RecordingStore.directories(in: source) {
+      // Recordings only: the save folder can be a shared one such as Documents,
+      // and everything else in it is not Blackbox's to move.
+      for directory in RecordingStore.recordingDirectories(in: source) {
         let target = destination.appendingPathComponent(directory.lastPathComponent)
         do {
           try FileManager.default.moveItem(at: directory, to: target)
@@ -769,7 +777,7 @@ struct SettingsView: View {
     let previous = URL(fileURLWithPath: saveDirectoryPath)
     guard previous.path != url.path else { return }
     saveDirectoryPath = url.path(percentEncoded: false)
-    if !RecordingStore.directories(in: previous).isEmpty {
+    if !RecordingStore.recordingDirectories(in: previous).isEmpty {
       pendingMove = (from: previous, to: url)
     }
   }

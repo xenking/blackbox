@@ -1729,4 +1729,56 @@ struct TranscriptionCoordinatorTests {
     await harness.wait { coordinator.status(for: directory) == .completed }
     await harness.wait { !coordinator.hasActiveJobs }
   }
+
+  // MARK: - Third review round
+
+  @Test("a deleted recording's Soniox ids survive a failed delete and are retried at launch")
+  func deletedRecordingCleanupSurvivesFailedDelete() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setDeleteSucceeds(false)
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    // What the delete action does: capture the job, trash the directory, then forget it.
+    let job = TranscriptionJob(fileId: "file-1", transcriptionId: "t-1")
+    try FileManager.default.removeItem(at: directory)
+    coordinator.forgetDeletedRecording(recordingDirectory: directory, job: job)
+    await harness.wait { await harness.service.deletedFileIds == ["file-1"] }
+
+    let pending = TranscriptionCoordinator.pendingCleanupEntries(in: harness.root)
+    #expect(pending.count == 1, "the failed delete leaves the ids where launch can find them")
+    #expect(
+      pending.first?.job.fileIds == ["file-1"] && pending.first?.job.transcriptionIds == ["t-1"])
+
+    await harness.service.setDeleteSucceeds(true)
+    harness.makeCoordinator().resumePendingJobs()
+    await harness.wait { TranscriptionCoordinator.pendingCleanupEntries(in: harness.root).isEmpty }
+    #expect(await harness.service.deletedTranscriptionIds.contains("t-1"))
+  }
+
+  @Test("a confirmed delete of a deleted recording leaves no cleanup record")
+  func confirmedDeleteRetiresTheRecord() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    try FileManager.default.removeItem(at: directory)
+
+    coordinator.forgetDeletedRecording(
+      recordingDirectory: directory, job: TranscriptionJob(fileId: "file-1"))
+    await harness.wait { TranscriptionCoordinator.pendingCleanupEntries(in: harness.root).isEmpty }
+
+    #expect(await harness.service.deletedFileIds == ["file-1"])
+  }
+
+  @Test("the cleanup folder is not mistaken for a recording")
+  func cleanupFolderIsHidden() async throws {
+    let harness = try TranscriptionHarness()
+    try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    coordinator.forgetDeletedRecording(
+      recordingDirectory: harness.root.appendingPathComponent("gone"),
+      job: TranscriptionJob(fileId: "file-1"))
+
+    #expect(RecordingStore.directories(in: harness.root).map(\.lastPathComponent) == ["call-1"])
+  }
 }

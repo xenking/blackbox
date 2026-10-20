@@ -178,9 +178,15 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// create if the record naming them did not reach disk - a crash then makes
   /// the next launch bill the same audio again with the first artifact orphaned.
   func write(for recordingDirectory: URL) throws {
+    try write(to: Self.url(for: recordingDirectory))
+  }
+
+  func write(to fileURL: URL) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    try encoder.encode(self).write(to: Self.url(for: recordingDirectory), options: .atomic)
+    try FileManager.default.createDirectory(
+      at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try encoder.encode(self).write(to: fileURL, options: .atomic)
   }
 }
 
@@ -563,8 +569,52 @@ final class TranscriptionCoordinator {
     jobs[recordingDirectory.path]?.cancel()
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
-    guard let job else { return }
-    _ = discardRemote(job: job)
+    guard let job, job.hasRemoteArtifacts else { return }
+    // The sidecar naming the remote artifacts went to the Trash with the
+    // directory, so a delete that fails here (offline, key rejected) would have
+    // nothing left to retry from. The ids are recorded in the save folder first,
+    // where launch-time resume scans, and retired only once Soniox confirms.
+    let entry = Self.cleanupEntryURL(in: dependencies.saveDirectory(), for: recordingDirectory)
+    var pending = job
+    pending.awaitingRemoteDelete = true
+    pending.lastError = nil
+    do {
+      try pending.write(to: entry)
+    } catch {
+      Log.error(
+        Log.transcription, "transcription",
+        "could not record Soniox cleanup for the deleted recording \(recordingDirectory.lastPathComponent): \(error.localizedDescription)"
+      )
+    }
+    _ = discardRemote(job: job) { try? FileManager.default.removeItem(at: entry) }
+  }
+
+  /// Hidden, so every directory scan (which skips dot-names) ignores it, and
+  /// kept in the save folder so it survives the recording going to the Trash.
+  nonisolated static let cleanupDirectoryName = ".remote-cleanup"
+
+  nonisolated static func cleanupEntryURL(in saveDirectory: URL, for recordingDirectory: URL) -> URL
+  {
+    saveDirectory
+      .appendingPathComponent(cleanupDirectoryName, isDirectory: true)
+      .appendingPathComponent("\(recordingDirectory.lastPathComponent)-\(UUID().uuidString).json")
+  }
+
+  /// Entries left by deleted recordings whose Soniox delete did not complete.
+  nonisolated static func pendingCleanupEntries(in saveDirectory: URL) -> [(
+    url: URL, job: TranscriptionJob
+  )] {
+    let directory = saveDirectory.appendingPathComponent(cleanupDirectoryName, isDirectory: true)
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+      return []
+    }
+    return names.filter { $0.hasSuffix(".json") }.compactMap { name in
+      let url = directory.appendingPathComponent(name)
+      guard let data = try? Data(contentsOf: url),
+        let job = try? JSONDecoder().decode(TranscriptionJob.self, from: data)
+      else { return nil }
+      return (url, job)
+    }
   }
 
   func cancel(recordingDirectory: URL) {
@@ -601,6 +651,14 @@ final class TranscriptionCoordinator {
       if sweepScratchFiles { await sweep() }
       let pending = await Self.directoriesWithPendingJobs(in: directory)
       guard let self else { return }
+      for entry in Self.pendingCleanupEntries(in: directory) {
+        Log.info(
+          Log.transcription, "transcription",
+          "retrying Soniox cleanup for a deleted recording (\(entry.url.lastPathComponent))")
+        self.discardRemote(job: entry.job) {
+          try? FileManager.default.removeItem(at: entry.url)
+        }
+      }
       for recordingDirectory in pending {
         // Read fresh, and skip anything already in flight: the user can have
         // hit Retry on one of these while the sweep above was running.
@@ -900,7 +958,8 @@ final class TranscriptionCoordinator {
         }
 
         statuses[key] = .transcribing
-        let document = try await awaitDocument(for: job, using: service)
+        var document = try await awaitDocument(for: job, using: service)
+        document.config = job.effectiveConfig
 
         // The recording can be deleted while its job runs; writing the
         // transcript now would resurrect a file next to something that is
