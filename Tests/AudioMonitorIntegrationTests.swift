@@ -135,6 +135,109 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("display loss restarts auto-recording without consuming the restart budget")
+  func displayLostRestartsAutoRecordingUnbounded() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    // The systemStopped budget is 3 restarts per 30s. Display sleep is not a
+    // recorder fault: well past that many losses must still restart.
+    for expectedCount in 2...8 {
+      let current = try #require(harness.recorderFactory.createdSessions.last)
+      current.emitFailure(.displayLost)
+      await settle()
+      #expect(harness.recorderFactory.createdSessions.count == expectedCount)
+      #expect(monitor.isRecording, "auto-recording must resume after display loss")
+    }
+    #expect(monitor.errorMessage != "Recording failed repeatedly")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("repeated display loss on a display that never goes away stops instead of looping")
+  func displayLostRestartLoopIsBounded() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    harness.activeCallers = ["com.example.Zoom"]
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+    harness.clock.advance(by: .seconds(3))
+    await settle()
+
+    // The clock never advances, so every loss lands inside one 30s window.
+    for _ in 0..<12 {
+      guard let current = harness.recorderFactory.createdSessions.last, monitor.isRecording
+      else { break }
+      current.emitFailure(.displayLost)
+      await settle()
+    }
+
+    // 1 initial + at most 10 restarts, then it gives up and says so.
+    #expect(harness.recorderFactory.createdSessions.count == 11)
+    #expect(!monitor.isRecording)
+    #expect(monitor.errorMessage == "Recording failed repeatedly")
+
+    await monitor.stopMonitoring()
+  }
+
+  @Test("display loss restarts manual recording")
+  func displayLostRestartsManualRecording() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    monitor.startManualRecording()
+    await settle()
+    #expect(monitor.isManualRecording)
+    #expect(harness.recorderFactory.createdSessions.count == 1)
+
+    for expectedCount in 2...6 {
+      let current = try #require(harness.recorderFactory.createdSessions.last)
+      current.emitFailure(.displayLost)
+      await settle()
+      #expect(harness.recorderFactory.createdSessions.count == expectedCount)
+      #expect(monitor.isManualRecording, "manual recording must resume after display loss")
+    }
+
+    monitor.stopManualRecording()
+    await settle()
+    await monitor.stopMonitoring()
+  }
+
+  @Test("audio levels drive the menu bar glyph and stopping resets it")
+  func audioLevelsDriveLevelSymbol() async throws {
+    let harness = MonitorHarness()
+    let monitor = harness.makeMonitor()
+    monitor.startMonitoring(skipPermissionRequests: true)
+    await settle()
+
+    monitor.startManualRecording()
+    await settle()
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+
+    session.emitAudioLevel(0.015)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.mid")
+    session.emitAudioLevel(0.02)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.mid")
+    session.emitAudioLevel(0.04)
+    await settle()
+    #expect(monitor.levelSymbol == "waveform")
+
+    monitor.stopManualRecording()
+    await settle()
+    #expect(monitor.levelSymbol == "waveform.low")
+    await monitor.stopMonitoring()
+  }
+
   @Test("multiple simultaneous callers records with nil bundleID")
   func multipleSimultaneousCallersRecordsWithNilBundleID() async throws {
     let harness = MonitorHarness()
@@ -552,6 +655,41 @@ struct AudioMonitorIntegrationTests {
     await monitor.stopMonitoring()
   }
 
+  @Test("reports the saved recording directory for a manually stopped recording")
+  func reportsSavedRecordingOnManualStop() async {
+    let harness = MonitorHarness()
+    let saved = FileManager.default.temporaryDirectory
+      .appendingPathComponent("call-1")
+    harness.recorderFactory.stopURL = saved
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    monitor.stopManualRecording()
+    await settle()
+
+    #expect(harness.savedRecordings == [saved])
+  }
+
+  @Test("reports the saved recording directory when a recording ends in a failure")
+  func reportsSavedRecordingOnFailure() async throws {
+    let harness = MonitorHarness()
+    let saved = FileManager.default.temporaryDirectory
+      .appendingPathComponent("call-1")
+    harness.recorderFactory.stopURL = saved
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    let session = try #require(harness.recorderFactory.createdSessions.first)
+    session.emitFailure(.permissionDenied)
+    await settle()
+
+    #expect(harness.savedRecordings == [saved])
+
+    await monitor.stopMonitoring()
+  }
+
   @Test("title exclusion is scoped to the matching caller")
   func titleExclusionDoesNotAffectOtherCallers() async throws {
     let harness = MonitorHarness()
@@ -590,5 +728,19 @@ struct AudioMonitorIntegrationTests {
     #expect(harness.recorderFactory.createdSessions.count == 1)
 
     await monitor.stopMonitoring()
+  }
+
+  @Test("reports nothing when a recording produced no file")
+  func reportsNothingWithoutAFile() async {
+    let harness = MonitorHarness()
+    harness.recorderFactory.stopURL = nil
+    let monitor = harness.makeMonitor()
+
+    monitor.startManualRecording()
+    await settle()
+    monitor.stopManualRecording()
+    await settle()
+
+    #expect(harness.savedRecordings.isEmpty)
   }
 }

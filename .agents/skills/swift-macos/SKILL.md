@@ -1,23 +1,21 @@
 ---
 name: swift-macos
-description: Comprehensive macOS app development with Swift 6.3, SwiftUI, SwiftData, Swift Concurrency, Foundation Models, Swift Testing, ScreenCaptureKit, and app distribution. Use when building native Mac apps, implementing windows/scenes/navigation/menus/toolbars, SwiftData models and queries, modern concurrency, on-device AI, testing, screen/audio capture, menu bar apps, AppKit bridges, login items, process monitoring, or App Store and Developer ID distribution. Triggers on macOS app, SwiftUI macOS, SwiftData, Swift concurrency, Foundation Models, Swift Testing, ScreenCaptureKit, screen capture, screen recording, AVFoundation, MenuBarExtra, NSViewRepresentable, notarize, login item, and process monitoring.
+description: macOS apps with Swift 6.3, SwiftUI, SwiftData, Swift Concurrency, Foundation Models, Swift Testing, and ScreenCaptureKit. Use when building native Mac apps - windows, menus, SwiftData, on-device AI, capture, AppKit bridges, notarization.
 metadata:
-  version: "0.6.1"
-  upstream: "swift@6.3.3, xcode@26.6"
+  version: "0.8.4"
+  categories: "development"
+  topics: "swift, swiftui, macos, swiftdata, screencapturekit"
+  upstream: "swift@6.3.3, xcode@26.6, macos@26.6.2"
   openclaw:
     homepage: https://github.com/tenequm/skills/tree/main/skills/swift-macos
     emoji: "🍎"
     os:
-      - darwin
-    requires:
-      bins:
-        - swift
-        - xcodebuild
+      - macos
 ---
 
 # macOS App Development - Swift 6.3
 
-Build native macOS apps with Swift 6.3 (latest: 6.3.3, bundled in Xcode 26.6, Jun 2026), SwiftUI, SwiftData, and macOS 26 Tahoe (26.5 current). Target macOS 14+ for SwiftData/@Observable, macOS 15+ for latest SwiftUI, macOS 26 for Liquid Glass and Foundation Models. For the WWDC 2026 beta stack (macOS 27, Xcode 27, Swift 6.4, shipping fall 2026), see `references/fall-2026-releases.md`.
+Build native macOS apps with Swift 6.3 (latest: 6.3.3, bundled in Xcode 26.6, Jun 2026), SwiftUI, SwiftData, and macOS 26 Tahoe (26.6.2 current). Target macOS 14+ for SwiftData/@Observable, macOS 15+ for latest SwiftUI, macOS 26 for Liquid Glass and Foundation Models. Note Xcode 26.6 still bundles the macOS **26.5** SDK, so 26.6-only API is not yet buildable. For the WWDC 2026 beta stack (macOS 27, Xcode 27, Swift 6.4, shipping fall 2026), see `references/fall-2026-releases.md`.
 
 ## Quick Start
 
@@ -29,7 +27,8 @@ import SwiftData
 final class Project {
     var name: String
     var createdAt: Date
-    @Relationship(deleteRule: .cascade) var tasks: [Task] = []
+    // Named ProjectTask, not Task - `Task` would shadow `Swift.Task`
+    @Relationship(deleteRule: .cascade) var tasks: [ProjectTask] = []
 
     init(name: String) {
         self.name = name
@@ -38,7 +37,7 @@ final class Project {
 }
 
 @Model
-final class Task {
+final class ProjectTask {
     var title: String
     var isComplete: Bool
     var project: Project?
@@ -55,7 +54,7 @@ struct MyApp: App {
         WindowGroup("Projects") {
             ContentView()
         }
-        .modelContainer(for: [Project.self, Task.self])
+        .modelContainer(for: [Project.self, ProjectTask.self])
         .defaultSize(width: 900, height: 600)
 
         #if os(macOS)
@@ -187,16 +186,22 @@ let count = try context.fetchCount(desc)
     var name: String
     @Relationship(deleteRule: .cascade, inverse: \Book.author)
     var books: [Book] = []
+
+    init(name: String) { self.name = name }
 }
 
 @Model final class Book {
     var title: String
     var author: Author?
     @Relationship var tags: [Tag] = []  // many-to-many
+
+    init(title: String) { self.title = title }
 }
 ```
 
 Delete rules: `.cascade`, `.nullify` (default), `.deny`, `.noAction`.
+
+Every `@Model` class needs an explicit initializer - the macro does not synthesize one, and omitting it fails with `@Model requires an initializer be provided for '<Type>'`.
 
 ### Schema Migration
 
@@ -326,10 +331,12 @@ import FoundationModels
 
 let session = LanguageModelSession()
 let response = try await session.respond(to: "Summarize: \(text)")
+print(response.content)  // respond() returns Response<Content>, not Content
 
 // Structured output
 @Generable struct Summary { var title: String; var points: [String] }
-let result: Summary = try await session.respond(to: prompt, generating: Summary.self)
+let result = try await session.respond(to: prompt, generating: Summary.self)
+let summary: Summary = result.content
 ```
 
 For tool calling, streaming, and sessions, see `references/foundation-models.md`.
@@ -428,9 +435,11 @@ config.sampleRate = 48000
 config.channelCount = 2
 config.excludesCurrentProcessAudio = true
 
-// Audio-only: minimize video overhead
+// Audio-only: throttle the video pipeline (it always runs). minimumFrameInterval is a
+// MINIMUM gap between frames - 1/Int32.max is ~0s, i.e. native refresh rate (60+ fps
+// of discarded frames and a full-screen recomposite each). Use 1 fps.
 config.width = 2; config.height = 2
-config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
 let stream = SCStream(filter: filter, configuration: config, delegate: self)
 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: nil)
@@ -472,17 +481,17 @@ See `references/architecture.md` for all patterns with examples.
 |------|-------------|
 | `references/fall-2026-releases.md` | WWDC 2026 beta stack: macOS 27, Xcode 27, Swift 6.4, Foundation Models next-gen, Core AI, Spatial Preview, mandatory Liquid Glass |
 | **SwiftUI & macOS** | |
-| `references/app-lifecycle.md` | Window management, scenes, DocumentGroup, MenuBarExtra gotchas, async termination, LSUIElement issues |
+| `references/app-lifecycle.md` | Window management, scenes, DocumentGroup, MenuBarExtra gotchas, async termination (and the terminate-from-main-queue hang), LSUIElement issues |
 | `references/swiftui-macos.md` | Sidebar, Inspector, Table, forms, popovers, sheets, search |
-| `references/appkit-interop.md` | NSViewRepresentable, hosting controllers, AppKit bridging, NSPanel/floating HUD |
-| `references/screen-capture-audio.md` | ScreenCaptureKit, SCStream gotchas, SCStream teardown hazards, AVAudioEngine dual pipeline, AVAssetWriter crash safety, non-interleaved stereo trap, TCC gotchas, CDHash degraded-state after reinstall |
+| `references/appkit-interop.md` | NSViewRepresentable, hosting controllers, NSHostingSceneRepresentation, sizing/scene-bridging options, AppKit Liquid Glass (NSGlassEffectView), pasteboard privacy, NSPanel/floating HUD |
+| `references/screen-capture-audio.md` | ScreenCaptureKit, SCStream gotchas, SCStream teardown hazards, AVAudioEngine dual pipeline, AVAssetWriter crash safety, non-interleaved stereo trap, TCC gotchas, CDHash degraded-state after reinstall, SpeechAnalyzer transcription |
 | `references/core-audio-tap.md` | CATap for per-process audio: tap-only aggregate (HFP-safe), drift compensation, rate-change anti-pattern, interleaved-stereo frame-count trap, IO proc isolation |
-| `references/system-integration.md` | Keyboard shortcuts, drag & drop, file access, App Intents, process monitoring, CoreAudio per-process APIs, login items, LSUIElement, idle sleep prevention |
+| `references/system-integration.md` | Keyboard shortcuts, drag & drop, file access, App Intents (entities, Spotlight, snippets), widgets & Control Center, process monitoring, AXUIElement, CoreAudio per-process APIs, login items, XPC, LSUIElement, os.Logger & signposts, privacy usage descriptions |
 | `references/foundation-models.md` | On-device AI: guided generation, tool calling, streaming |
 | `references/architecture.md` | MVVM, TCA, dependency injection, project structure |
 | `references/testing.md` | Swift Testing, exit tests, attachments, UI testing, XCTest migration |
-| `references/distribution.md` | App Store, Developer ID, notarization gotchas, nested bundle signing, sandboxing, universal binaries |
-| `references/spm-build.md` | Package.swift, Swift Build, plugins, macros, manual .app bundle assembly, mixed ObjC targets, CLT testing |
+| `references/distribution.md` | App Store, Developer ID, notarization gotchas, nested bundle signing, xcodebuild signing traps (silent ad-hoc builds), sandboxing, universal binaries |
+| `references/spm-build.md` | Package.swift, Swift Build, plugins, macros, plugin/macro validation gates, Metal toolchain download, manual .app bundle assembly, mixed ObjC targets, CLT testing |
 | **Concurrency** | |
 | `references/approachable-concurrency.md` | Default MainActor isolation, @concurrent, nonisolated async, runtime pitfalls |
 | `references/actors-isolation.md` | Actor model, global actors, custom executors, reentrancy |

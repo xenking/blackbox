@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 @preconcurrency import AudioToolbox
 import CoreAudio
+import IOKit.pwr_mgt
 import ObjCExceptionCatcher
 @preconcurrency import ScreenCaptureKit
 
@@ -19,6 +20,9 @@ import ObjCExceptionCatcher
 actor AudioRecorder {
   nonisolated let bundleID: String?
   nonisolated let appName: String
+  /// What goes in logs: the bare app. `appName` can carry the window or browser-tab title
+  /// (`RecordingNaming`), which is a meeting name, and diagnostics get copied into bug reports.
+  private nonisolated var logName: String { RecordingNaming.split(appName).app }
   nonisolated let titlePrefix: String
   nonisolated let micEnabled: Bool
   nonisolated let saveDirectory: URL
@@ -64,6 +68,11 @@ actor AudioRecorder {
   private var phase: Phase = .notStarted
   private var cancelRequested = false
   private var activity: NSObjectProtocol?
+  /// Keeps the display awake for the duration of a recording. The system-audio
+  /// SCStream is display-wide, and SCK tears it down with -3815 the moment its
+  /// display sleeps, so idle display sleep mid-call would otherwise end the
+  /// system track.
+  private var displaySleepAssertion: IOPMAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
   private var diskSpaceTimer: DispatchSourceTimer?
   private var lowDiskSpaceWarned = false
   private var micBuffersConversionFailed: Int = 0
@@ -139,6 +148,9 @@ actor AudioRecorder {
         AudioObjectID(kAudioObjectSystemObject), &address, audioQueue, block)
     }
     if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    if displaySleepAssertion != IOPMAssertionID(kIOPMNullAssertionID) {
+      IOPMAssertionRelease(displaySleepAssertion)
+    }
   }
 
   // MARK: - Start / Stop
@@ -159,20 +171,16 @@ actor AudioRecorder {
   func start() async throws {
     precondition(phase == .notStarted, "AudioRecorder.start() called more than once")
     phase = .starting
-    Log.info(Log.recorder, "recorder", "start() for \(appName) (\(bundleID ?? "all"))")
+    Log.info(Log.recorder, "recorder", "start() for \(logName) (\(bundleID ?? "all"))")
 
     do {
       await testStartCheckpoint?(.beforeContent)
       try checkAlive()
 
-      // 1. Discover a display to drive the system-audio SCStream.
-      let content = try await SCShareableContent.excludingDesktopWindows(
-        false, onScreenWindowsOnly: false)
-      try checkAlive()
-      guard let display = content.displays.first else {
-        Log.error(Log.recorder, "recorder", "no display found for \(appName)")
-        throw RecorderError.noDisplay
-      }
+      // 1. Discover a display to drive the system-audio SCStream. With the
+      // display asleep (a restart after -3815 lands here) SCK reports none;
+      // wait for it to come back rather than failing the whole recording.
+      let display = try await waitForDisplay()
 
       // Display-wide audio capture (no window/app exclusions). SCStream's display
       // mix is driven by the OS-composited output path, not a specific hardware
@@ -220,19 +228,30 @@ actor AudioRecorder {
 
       let stream = SCStream(filter: filter, configuration: config, delegate: proxy)
       try stream.addStreamOutput(proxy, type: .audio, sampleHandlerQueue: audioQueue)
+      // Subscribe the (ignored) screen output on its own queue, otherwise
+      // SCStream logs "stream output NOT found. Dropping frame" per video
+      // frame. Best-effort: losing it costs log noise, never a recording.
+      do {
+        try stream.addStreamOutput(proxy, type: .screen, sampleHandlerQueue: Self.videoQueue)
+      } catch {
+        Log.error(
+          Log.recorder, "recorder",
+          "screen output subscribe failed for \(logName): \(error.localizedDescription)")
+      }
       self.displayStream = stream
 
       activity = ProcessInfo.processInfo.beginActivity(
         options: .userInitiated,
         reason: "Recording call audio"
       )
+      takeDisplaySleepAssertion()
 
       try await stream.startCapture()
       // Flip to .running synchronously after startCapture returns so the
       // `phase == .running` guard on handleSystemSampleBuffer accepts buffers
       // from first delivery. No await between here and the flip.
       phase = .running
-      Log.info(Log.recorder, "recorder", "SCStream started for \(appName)")
+      Log.info(Log.recorder, "recorder", "SCStream started for \(logName)")
 
       await testStartCheckpoint?(.afterStreamStart)
       try checkAlive()
@@ -251,7 +270,7 @@ actor AudioRecorder {
         }
       }
     } catch {
-      Log.error(Log.recorder, "recorder", "recording setup failed for \(appName): \(error)")
+      Log.error(Log.recorder, "recorder", "recording setup failed for \(logName): \(error)")
       await cleanupPartialStart()
       phase = .stopped
       throw mappedStartError(error)
@@ -281,18 +300,11 @@ actor AudioRecorder {
     driftTimer = nil
 
     if let stream {
-      // Race stopCapture against a 3s timeout (mirrors the steady-state stop
-      // path) so a hung SCStream cannot exceed applicationShouldTerminate's
-      // 8s budget.
-      await withTaskGroup(of: Void.self) { group in
-        group.addTask { try? await stream.stopCapture() }
-        group.addTask { try? await Task.sleep(for: .seconds(3)) }
-        await group.next()
-        group.cancelAll()
-      }
+      await Self.stopCaptureWithTimeout(stream, appName: logName)
     }
     if let pipe { _ = await pipe.stop() }
     if let activitySnap { ProcessInfo.processInfo.endActivity(activitySnap) }
+    releaseDisplaySleepAssertion()
     dskTimer?.cancel()
     drftTimer?.cancel()
   }
@@ -300,7 +312,7 @@ actor AudioRecorder {
   /// Stops capture and finalizes the recording file.
   @discardableResult
   func stop() async -> URL? {
-    Log.info(Log.recorder, "recorder", "stop() for \(appName) (phase=\(phase))")
+    Log.info(Log.recorder, "recorder", "stop() for \(logName) (phase=\(phase))")
 
     switch phase {
     case .notStarted:
@@ -331,15 +343,7 @@ actor AudioRecorder {
   /// writer, return saved URL.
   private func stopRunning() async -> URL? {
     if let stream = displayStream {
-      // Race stopCapture against a 3s timeout so a hung SCStream (documented
-      // under WindowServer stalls) cannot exceed applicationShouldTerminate's
-      // 8s budget and corrupt the recording.
-      await withTaskGroup(of: Void.self) { group in
-        group.addTask { try? await stream.stopCapture() }
-        group.addTask { try? await Task.sleep(for: .seconds(3)) }
-        await group.next()
-        group.cancelAll()
-      }
+      await Self.stopCaptureWithTimeout(stream, appName: logName)
     }
     self.displayStream = nil
     self.streamProxy = nil
@@ -383,20 +387,104 @@ actor AudioRecorder {
       ProcessInfo.processInfo.endActivity(activity)
       self.activity = nil
     }
+    releaseDisplaySleepAssertion()
 
     return savedURL
   }
 
+  /// Waits up to 3s for `stopCapture` so a hung SCStream (documented under
+  /// WindowServer stalls) cannot exceed applicationShouldTerminate's 8s budget
+  /// and truncate the recording. The stop runs detached: `withTaskGroup` awaits
+  /// every child before returning, and `stopCapture` ignores cancellation, so a
+  /// grouped race would still block for the full hang.
+  private static func stopCaptureWithTimeout(_ stream: SCStream, appName: String) async {
+    let race = StopCaptureRace()
+    let stopped = await withCheckedContinuation {
+      (continuation: CheckedContinuation<Bool, Never>) in
+      Task.detached {
+        try? await stream.stopCapture()
+        await race.settle(continuation, with: true)
+      }
+      Task.detached {
+        try? await Task.sleep(for: .seconds(3))
+        await race.settle(continuation, with: false)
+      }
+    }
+    if !stopped {
+      Log.error(
+        Log.recorder, "recorder",
+        "SCStream stopCapture timed out after 3s for \(appName); stream may remain running")
+    }
+  }
+
+  /// Serial queue for the discarded `.screen` output, kept off `audioQueue` so
+  /// video delivery can never delay an audio buffer.
+  private static let videoQueue = DispatchQueue(
+    label: "com.tenequm.blackbox.video", qos: .utility)
+
+  // MARK: - Display Availability
+
+  /// How long a restart will wait for a display to reappear before giving up.
+  /// Long enough to ride out a screen-off stretch in a call; bounded so a
+  /// truly headless failure still surfaces.
+  static let displayWaitTimeout: Duration = .seconds(300)
+  static let displayPollInterval: Duration = .seconds(2)
+
+  private func waitForDisplay() async throws -> SCDisplay {
+    let deadline = ContinuousClock.now + Self.displayWaitTimeout
+    var announced = false
+    while true {
+      let content = try await SCShareableContent.excludingDesktopWindows(
+        false, onScreenWindowsOnly: false)
+      try checkAlive()
+      if let display = content.displays.first {
+        if announced { Log.info(Log.recorder, "recorder", "display is back for \(logName)") }
+        return display
+      }
+      if !announced {
+        announced = true
+        Log.error(
+          Log.recorder, "recorder",
+          "no display found for \(appName) (asleep?); waiting up to \(Self.displayWaitTimeout)")
+      }
+      guard ContinuousClock.now < deadline else { throw RecorderError.noDisplay }
+      try await Task.sleep(for: Self.displayPollInterval)
+      try checkAlive()
+    }
+  }
+
+  private func takeDisplaySleepAssertion() {
+    guard displaySleepAssertion == IOPMAssertionID(kIOPMNullAssertionID) else { return }
+    var id = IOPMAssertionID(kIOPMNullAssertionID)
+    let status = IOPMAssertionCreateWithName(
+      kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+      IOPMAssertionLevel(kIOPMAssertionLevelOn),
+      "Blackbox is recording a call" as CFString,
+      &id)
+    if status == kIOReturnSuccess {
+      displaySleepAssertion = id
+    } else {
+      Log.error(Log.recorder, "recorder", "display sleep assertion failed: \(status)")
+    }
+  }
+
+  private func releaseDisplaySleepAssertion() {
+    guard displaySleepAssertion != IOPMAssertionID(kIOPMNullAssertionID) else { return }
+    IOPMAssertionRelease(displaySleepAssertion)
+    displaySleepAssertion = IOPMAssertionID(kIOPMNullAssertionID)
+  }
+
   // MARK: - SCStream Configuration
 
-  /// Builds the audio-only SCStreamConfiguration. The tiny 2x2 frame and
-  /// infinite `minimumFrameInterval` suppress video pipeline overhead; only
-  /// the `.audio` output is subscribed.
+  /// Builds the audio-only SCStreamConfiguration. The tiny 2x2 frame and a
+  /// 1 fps `minimumFrameInterval` keep video pipeline overhead negligible.
+  /// A near-zero interval (1/Int32.max) means *maximum* frame rate: SCStream
+  /// recomposites the display at refresh rate and drops every frame (issue #17).
   private func makeStreamConfig() -> SCStreamConfiguration {
     let config = SCStreamConfiguration()
     config.width = 2
     config.height = 2
-    config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+    config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
     config.showsCursor = false
     config.capturesAudio = true
     config.sampleRate = Int(RecordingPipeline.writerSampleRate)
@@ -433,6 +521,7 @@ actor AudioRecorder {
     switch code {
     case -3801: failure = .permissionDenied
     case -3802, -3821: failure = .systemStopped
+    case -3815: failure = .displayLost
     default: failure = .other(description)
     }
     Log.error(
@@ -970,6 +1059,20 @@ actor AudioRecorder {
   }
 }
 
+// MARK: - StopCaptureRace
+
+/// Guards the stop-vs-timeout continuation so whichever finishes first resumes
+/// it exactly once; resuming a CheckedContinuation twice traps.
+private actor StopCaptureRace {
+  private var settled = false
+
+  func settle(_ continuation: CheckedContinuation<Bool, Never>, with value: Bool) {
+    guard !settled else { return }
+    settled = true
+    continuation.resume(returning: value)
+  }
+}
+
 // MARK: - SCStreamProxy
 
 /// NSObject delegate/output for SCStream. Actors cannot inherit from NSObject,
@@ -1106,6 +1209,10 @@ enum RecorderError: Error, LocalizedError {
 /// AudioMonitor uses these to decide recovery strategy.
 enum RecorderFailure: Sendable {
   case systemStopped
+  /// SCStream -3815 "Failed to find any displays or windows to capture": the
+  /// display went to sleep under a display-wide stream. Recoverable once a
+  /// display is back; not a fault of the recorder.
+  case displayLost
   case permissionDenied
   case lowDiskSpace
   case other(String)

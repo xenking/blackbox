@@ -8,38 +8,64 @@ import UserNotifications
 
 struct SettingsView: View {
   @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-  @AppStorage("autoRecord") private var autoRecord = true
-  @AppStorage("gracePeriod") private var gracePeriod: Double = 5
-  @AppStorage("micEnabled") private var micEnabled = true
-  @AppStorage("saveDirectoryPath") private var saveDirectoryPath = defaultSaveDirectoryPath
-  @AppStorage("namePrefixTemplate") private var namePrefixTemplate = "YYMM-DD-"
-  @AppStorage("notifyOnStart") private var notifyOnStart = true
-  @AppStorage("notifyOnSaved") private var notifyOnSaved = true
-  @AppStorage("notifyOnError") private var notifyOnError = true
-  @AppStorage("excludedBundleIDs") private var excludedBundleIDsRaw = ""
-  @AppStorage("excludedTitlePatterns") private var excludedTitlePatternsRaw = ""
-  @AppStorage("transcriptionLanguages") private var transcriptionLanguages =
+  @AppStorage(SettingsKeys.autoRecord) private var autoRecord = true
+  @AppStorage(SettingsKeys.gracePeriod) private var gracePeriod: Double = 5
+  @AppStorage(SettingsKeys.micEnabled) private var micEnabled = true
+  @AppStorage(SettingsKeys.saveDirectoryPath) private var saveDirectoryPath =
+    defaultSaveDirectoryPath
+  @AppStorage(SettingsKeys.namePrefixTemplate) private var namePrefixTemplate = "YYMM-DD-"
+  @AppStorage(SettingsKeys.notifyOnStart) private var notifyOnStart = true
+  @AppStorage(SettingsKeys.notifyOnSaved) private var notifyOnSaved = true
+  @AppStorage(SettingsKeys.notifyOnError) private var notifyOnError = true
+  @AppStorage(SettingsKeys.excludedBundleIDs) private var excludedBundleIDsRaw = ""
+  @AppStorage(SettingsKeys.excludedTitlePatterns) private var excludedTitlePatternsRaw = ""
+  @AppStorage(SettingsKeys.transcriptionLanguages) private var transcriptionLanguages =
     defaultTranscriptionLanguages
-  @AppStorage("writeMixedTrack") private var writeMixedTrack = true
-  @AppStorage("transcribeSeparateTracks") private var transcribeSeparateTracks = true
+  @AppStorage(SettingsKeys.writeMixedTrack) private var writeMixedTrack = true
+  @AppStorage(SettingsKeys.transcribeSeparateTracks) private var transcribeSeparateTracks = true
+  @AppStorage(SettingsKeys.transcriptionDiarization) private var transcriptionDiarization = "auto"
+  @AppStorage(SettingsKeys.transcriptionLanguageHintsStrict) private var languageHintsStrict = false
+  @AppStorage(SettingsKeys.transcriptionLanguageIdentification) private var languageIdentification =
+    true
+  @AppStorage(SettingsKeys.transcriptionContextGeneral) private var contextGeneral = ""
+  @AppStorage(SettingsKeys.transcriptionContextTerms) private var contextTerms = ""
+  @AppStorage(SettingsKeys.transcriptionContextText) private var contextText = ""
   @State private var newTitlePattern = ""
-  @State private var sonioxAPIKey = KeychainHelper.string(forKey: "sonioxAPIKey") ?? ""
-  @State private var apiKeySaveTask: Task<Void, Never>?
+  @Environment(TranscriptionCoordinator.self) private var transcription
+  @Environment(AudioMonitor.self) private var monitor
+  @State private var actionError: String?
+  /// Loaded in `onAppear`, not here: a `@State` default expression is evaluated
+  /// on every struct initialisation and thrown away after the first, so putting
+  /// a synchronous Keychain round-trip in it pays `SecItemCopyMatching` every
+  /// time this view's body runs.
+  @State private var sonioxAPIKey = ""
+  @AppStorage(SettingsKeys.autoTranscribe) private var autoTranscribe = false
+  @AppStorage(SettingsKeys.sonioxModel) private var sonioxModel = TranscriptionService.defaultModel
+  @State private var keyCheck: APIKeyCheck = .untested
+  @State private var revealAPIKey = false
+  @State private var didCopyDiagnostics = false
+  @State private var isEditingModel = false
 
   @State private var audioRecordingGranted = false
   @State private var micPermissionGranted = false
   @State private var notificationPermissionGranted = false
   @State private var storageStats: (count: Int, sizeFormatted: String)?
+  @State private var keyWriteTask: Task<Void, Never>?
+  @State private var appNameCache: [String: String] = [:]
+  @State private var pendingMove: (from: URL, to: URL)?
 
   var body: some View {
     Form {
+      // Most-changed first. "Excluded Apps" is an advanced, potentially long
+      // list and sat second, pushing the save location, transcription and
+      // permissions below the fold at the default window height.
       generalSection
-      excludedAppsSection
-      excludedTitlesSection
-      permissionsSection
       recordingsSection
       transcriptionSection
+      permissionsSection
       notificationsSection
+      excludedAppsSection
+      excludedTitlesSection
       debugSection
     }
     .formStyle(.grouped)
@@ -47,22 +73,82 @@ struct SettingsView: View {
       launchAtLogin = SMAppService.mainApp.status == .enabled
       refreshPermissions()
       migrateAPIKeyToKeychain()
+      // After the migration, which is what puts a legacy key in the Keychain.
+      if sonioxAPIKey.isEmpty, let stored = KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey)
+      {
+        sonioxAPIKey = stored
+      }
     }
     .onChange(of: sonioxAPIKey) { _, newValue in
-      apiKeySaveTask?.cancel()
-      apiKeySaveTask = Task {
-        try? await Task.sleep(for: .milliseconds(500))
-        guard !Task.isCancelled else { return }
-        KeychainHelper.setString(newValue, forKey: "sonioxAPIKey")
+      // Trimmed, because a pasted key routinely carries a trailing newline and
+      // the resulting 401 says nothing a user can act on.
+      let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      // The load in `onAppear` is a state write like any other, so it lands
+      // here too. Without this guard every appear would delete-then-re-add the
+      // stored key and discard a "Key works" result just obtained.
+      guard trimmed != (KeychainHelper.string(forKey: SettingsKeys.sonioxAPIKey) ?? "") else {
+        return
       }
+      // Debounced rather than written per keystroke. A partial prefix used to
+      // be live in the Keychain the whole time the user was typing, so a job
+      // finishing mid-typing authenticated with a truncated key and failed
+      // terminally.
+      keyCheck = .untested
+      keyWriteTask?.cancel()
+      keyWriteTask = Task {
+        try? await Task.sleep(for: .milliseconds(600))
+        guard !Task.isCancelled else { return }
+        guard KeychainHelper.setString(trimmed, forKey: SettingsKeys.sonioxAPIKey) else {
+          keyCheck = .invalid("Could not save the key to your keychain.")
+          return
+        }
+        transcription.apiKeyChanged()
+        if trimmed.isEmpty {
+          // A key that is gone cannot bill, and leaving the toggle on made the
+          // app look like it was transcribing when nothing was happening.
+          autoTranscribe = false
+        }
+      }
+    }
+    .confirmationDialog(
+      "Move existing recordings?",
+      isPresented: Binding(
+        get: { pendingMove != nil },
+        set: { if !$0 { pendingMove = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button("Move") {
+        if let move = pendingMove { moveRecordings(from: move.from, to: move.to) }
+        pendingMove = nil
+      }
+      Button("Leave Them", role: .cancel) { pendingMove = nil }
+    } message: {
+      Text(
+        "Blackbox will only show recordings in the new folder. Recordings left behind stay on disk, and any transcription still in progress for them will not resume."
+      )
     }
     .onReceive(
       NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
     ) { _ in
       refreshPermissions()
     }
-    .task {
+    .task(id: saveDirectoryPath) {
+      // Keyed on the path: it used to be computed once, so after changing the
+      // save folder the figure described a directory the user was no longer
+      // using.
       await computeStorageStats()
+    }
+    .alert(
+      "Could Not Move Recordings",
+      isPresented: Binding(
+        get: { actionError != nil },
+        set: { if !$0 { actionError = nil } }
+      )
+    ) {
+      Button("OK") { actionError = nil }
+    } message: {
+      Text(actionError ?? "")
     }
   }
 
@@ -93,13 +179,24 @@ struct SettingsView: View {
         .font(.caption)
         .foregroundStyle(.secondary)
 
-      HStack {
-        Text("Grace period: \(Int(gracePeriod))s")
-        Spacer()
-        Slider(value: $gracePeriod, in: 5...60, step: 5)
-          .frame(width: 200)
+      // A picker, not a slider: the slider announced a nameless percentage to
+      // VoiceOver, and "Grace period" was jargon.
+      //
+      // The slider it replaced allowed 5...60 by 5, so seven of its twelve
+      // values match no tag here and would otherwise render the control with
+      // nothing selected. They are surfaced rather than rounded away: rounding
+      // rewrote a setting the user had chosen, silently, and
+      // `AudioMonitorDependencies.live` reads the raw number, so rounding only
+      // the display would have shown "30 seconds" while the recorder used 45.
+      Picker("Keep recording for", selection: $gracePeriod) {
+        ForEach(Self.gracePeriodChoices, id: \.self) { seconds in
+          Text(Self.gracePeriodLabel(seconds)).tag(seconds)
+        }
+        if !Self.gracePeriodChoices.contains(gracePeriod) {
+          Text(Self.gracePeriodLabel(gracePeriod)).tag(gracePeriod)
+        }
       }
-      Text("Keeps recording briefly after the microphone stops, in case the call resumes")
+      Text("Keeps recording after the microphone stops, in case the call resumes")
         .font(.caption)
         .foregroundStyle(.secondary)
     }
@@ -136,13 +233,20 @@ struct SettingsView: View {
     addExcludedApp(bundleID: bundleID)
   }
 
+  /// Cached. This is read from `body`, and an uncached version walked the
+  /// filesystem once per excluded app on every body pass - so typing in the API
+  /// key field a few sections up re-resolved every bundle on the main thread.
   private func appDisplayName(forBundleID bundleID: String) -> String {
+    if let cached = appNameCache[bundleID] { return cached }
     guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
       let bundle = Bundle(url: url)
     else { return bundleID }
-    return (bundle.infoDictionary?["CFBundleDisplayName"] as? String)
+    let name =
+      (bundle.infoDictionary?["CFBundleDisplayName"] as? String)
       ?? (bundle.infoDictionary?["CFBundleName"] as? String)
       ?? bundleID
+    Task { @MainActor in appNameCache[bundleID] = name }
+    return name
   }
 
   /// Currently-running apps (not already excluded) available to add. Includes
@@ -184,6 +288,7 @@ struct SettingsView: View {
               .foregroundStyle(.secondary)
           }
           .buttonStyle(.plain)
+          .accessibilityLabel("Stop excluding \(appDisplayName(forBundleID: bundleID))")
         }
       }
 
@@ -266,11 +371,20 @@ struct SettingsView: View {
         "Screen & System Audio Recording",
         granted: audioRecordingGranted
       ) {
-        NSWorkspace.shared.open(
-          URL(
-            string:
-              "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
-          )!)
+        // Ask first where asking is possible. This always opened System
+        // Settings, where a first-run user may not even be listed yet - so
+        // there was nothing to toggle and no prompt had been shown.
+        if !CGRequestScreenCaptureAccess() {
+          openPrivacySettings(pane: .screenCapture)
+        }
+        refreshPermissions()
+      }
+      if !audioRecordingGranted {
+        Text(
+          "macOS applies this permission at launch, so Blackbox must be reopened after granting it."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
       permissionRow(
         "Microphone",
@@ -283,11 +397,7 @@ struct SettingsView: View {
             refreshPermissions()
           }
         } else {
-          NSWorkspace.shared.open(
-            URL(
-              string:
-                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
-            )!)
+          openPrivacySettings(pane: .microphone)
         }
       }
       permissionRow(
@@ -318,12 +428,22 @@ struct SettingsView: View {
       Image(systemName: granted ? "checkmark.circle.fill" : "xmark.circle.fill")
         .foregroundStyle(granted ? .green : .red)
       Text(name)
+      // In words as well as colour. Red/green alone is invisible to a
+      // colourblind reader, and VoiceOver read the row as a bare name with no
+      // status at all.
+      Text(granted ? "Granted" : "Not granted")
+        .font(.caption)
+        .foregroundStyle(.secondary)
       Spacer()
       if !granted {
-        Button("Fix", action: fixAction)
+        // "Fix" gave no hint that it opens another app, and three identical
+        // "Fix" buttons are indistinguishable when navigating by control.
+        Button("Open System Settings…", action: fixAction)
           .font(.caption)
       }
     }
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("\(name): \(granted ? "granted" : "not granted")")
   }
 
   // MARK: - Recordings
@@ -335,12 +455,14 @@ struct SettingsView: View {
           .lineLimit(1)
           .truncationMode(.head)
         Spacer()
-        Button("Choose...") { pickFolder() }
+        Button("Choose…") { pickFolder() }
       }
       if let stats = storageStats {
-        Text("\(stats.count) recordings, \(stats.sizeFormatted)")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        Text(
+          "\(stats.count) \(stats.count == 1 ? "recording" : "recordings"), \(stats.sizeFormatted)"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
 
       Toggle("Write a mixed track", isOn: $writeMixedTrack)
@@ -362,63 +484,164 @@ struct SettingsView: View {
 
   private var transcriptionSection: some View {
     Section("Transcription") {
-      SecureField("Soniox API Key", text: $sonioxAPIKey)
-      TextField("Languages", text: $transcriptionLanguages)
-        .help("Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en.")
-      Text(
-        "Comma-separated ISO language codes hinted to Soniox, for example ru or ru,en."
-      )
-      .font(.caption)
-      .foregroundStyle(.secondary)
-      Picker("Soniox source", selection: $transcribeSeparateTracks) {
-        Text("Separate microphone and desktop").tag(true)
-        Text("Mixed track with diarization").tag(false)
+      HStack {
+        // Was a bare `SecureField`. A pasted key with a trailing newline is
+        // invisible in a masked field and fails with an opaque 401, so there
+        // has to be a way to look at it.
+        if revealAPIKey {
+          TextField("Soniox API Key", text: $sonioxAPIKey)
+        } else {
+          SecureField("Soniox API Key", text: $sonioxAPIKey)
+        }
+        Button {
+          revealAPIKey.toggle()
+        } label: {
+          Image(systemName: revealAPIKey ? "eye.slash" : "eye")
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(revealAPIKey ? "Hide API key" : "Show API key")
       }
-      .pickerStyle(.segmented)
+      HStack(spacing: 8) {
+        Button("Verify Key") { verifyAPIKey() }
+          .disabled(sonioxAPIKey.isEmpty || keyCheck == .checking)
+        keyCheckLabel
+        Spacer()
+        Link("Get a key", destination: URL(string: "https://soniox.com")!)
+          .font(.caption)
+      }
+
+      TranscriptionOptionsFields(
+        languages: $transcriptionLanguages, languageHintsStrict: $languageHintsStrict,
+        languageIdentification: $languageIdentification, diarization: $transcriptionDiarization,
+        separateTracks: $transcribeSeparateTracks, contextGeneral: $contextGeneral,
+        contextTerms: $contextTerms, contextText: $contextText)
       Text(
-        transcribeSeparateTracks
-          ? "Transcribes your microphone separately; speaker diarization is used only for desktop audio."
-          : "Transcribes the mixed track with speaker diarization."
+        "These are the defaults; \"Transcribe With Options\" on a recording overrides them for one run."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
+
+      // Says what actually leaves the machine. "Audio is sent to Soniox" reads
+      // as "my side is sent", and a user cannot tell from that they are making
+      // a decision on the other participants' behalf.
       Text(
-        "Get your API key at soniox.com. Audio is sent to Soniox servers for transcription."
+        "Transcription uploads both sides of the call - your microphone and the other participants' audio, as separate files or mixed into one depending on the source above - to Soniox, a paid third-party service billed per hour of audio. Blackbox asks Soniox to delete it once the transcript comes back."
       )
       .font(.caption)
       .foregroundStyle(.secondary)
+
+      // A picker over known-good ids, plus a way to type one. The picker alone
+      // replaced a free-text field, and with one known model that left no route
+      // in the app to a new id at all - so a Soniox retirement would have needed
+      // a release, which is exactly what the free-text field existed to avoid.
+      Picker("Model", selection: $sonioxModel) {
+        ForEach(TranscriptionService.knownModels, id: \.self) { model in
+          Text(model).tag(model)
+        }
+        if !TranscriptionService.knownModels.contains(sonioxModel) {
+          Text(sonioxModel).tag(sonioxModel)
+        }
+      }
+      if isEditingModel || !TranscriptionService.knownModels.contains(sonioxModel) {
+        TextField("Model id", text: $sonioxModel)
+          .textFieldStyle(.roundedBorder)
+        Text("A model id Soniox does not serve fails after the audio is uploaded and billed.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      } else {
+        Button("Use a different model…") { isEditingModel = true }
+          .font(.caption)
+          .buttonStyle(.link)
+      }
+
+      Toggle("Transcribe recordings automatically", isOn: $autoTranscribe)
+        .disabled(sonioxAPIKey.isEmpty)
+      if sonioxAPIKey.isEmpty {
+        Text("Add an API key above to enable automatic transcription.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      } else {
+        Text(
+          "Every finished recording longer than three seconds is uploaded shortly after it saves, with no further prompt. Leave this off to transcribe one recording at a time from its detail view."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      }
     }
   }
 
   // MARK: - Notifications
 
+  /// Named for what it controls. These three gate the in-app floating panel,
+  /// not system notifications - so a user who denied Notifications still got
+  /// toasts over their screen and concluded the app ignored macOS privacy, and
+  /// a user who turned all three off still got the one real system notification
+  /// (permission revoked), which no toggle covers.
   private var notificationsSection: some View {
-    Section("Notifications") {
-      Toggle("Recording started", isOn: $notifyOnStart)
-      Toggle("Recording saved", isOn: $notifyOnSaved)
-      Toggle("Errors", isOn: $notifyOnError)
+    Section("On-screen Alerts") {
+      Toggle("When recording starts", isOn: $notifyOnStart)
+      Toggle("When a recording is saved", isOn: $notifyOnSaved)
+      Toggle("On errors", isOn: $notifyOnError)
+      Text(
+        "Brief panels in the corner of the screen. Separately, macOS notifies you if recording permission is revoked mid-call - that one follows your Notifications settings."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
     }
   }
 
   // MARK: - Debug
 
   private var debugSection: some View {
-    Section("Debug") {
+    Section("Troubleshooting") {
       HStack {
-        Button("Open Log File") {
+        Button("Reveal Logs in Finder") {
           let fm = FileManager.default
           try? fm.createDirectory(at: LogFile.directory, withIntermediateDirectories: true)
           NSWorkspace.shared.open(LogFile.directory)
         }
-        Button("Copy Debug Log") {
+        Button(didCopyDiagnostics ? "Copied" : "Copy Diagnostics") {
           let url = LogFile.export()
           if let contents = try? String(contentsOf: url, encoding: .utf8) {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(contents, forType: .string)
+            didCopyDiagnostics = true
+            Task {
+              try? await Task.sleep(for: .seconds(2))
+              didCopyDiagnostics = false
+            }
           }
         }
       }
+      // Said before it reaches the clipboard, not after it reaches a public
+      // issue tracker.
+      Text(
+        "Diagnostics include the names of apps you were on calls with and when those calls happened, but never recording titles or transcript text."
+      )
+      .font(.caption)
+      .foregroundStyle(.secondary)
+
+      Button("Setup Assistant…") {
+        guard let delegate = NSApplication.shared.delegate as? BlackboxApp.AppDelegate else {
+          Log.error(Log.app, "app", "setup assistant: app delegate is not BlackboxApp.AppDelegate")
+          return
+        }
+        delegate.showOnboarding()
+      }
+
+      LabeledContent("Version") {
+        Text(Self.versionString).foregroundStyle(.secondary)
+      }
     }
+  }
+
+  private static var versionString: String {
+    let info = Bundle.main.infoDictionary
+    let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+    // The build number is what Sparkle compares to decide whether an update
+    // exists, so it is the number to quote in a bug report.
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    return "\(short) (\(build))"
   }
 
   // MARK: - Permissions Refresh
@@ -438,24 +661,16 @@ struct SettingsView: View {
     let path = saveDirectoryPath
     let result: (count: Int, sizeFormatted: String)? = await Task.detached {
       let url = URL(fileURLWithPath: path)
-      guard
-        let files = try? FileManager.default.contentsOfDirectory(
-          at: url, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
-      else { return nil }
-
       var count = 0
       var totalBytes = 0
 
-      for dir in files
-      where FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent("audio.m4a").path)
-      {
-        let audioURL = dir.appendingPathComponent("audio.m4a")
+      for dir in RecordingStore.directories(in: url) {
+        let audioURL = dir.appendingPathComponent(RecordingStore.audioName)
         if let size = try? audioURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           count += 1
           totalBytes += size
         }
-        let processedURL = dir.appendingPathComponent("audio-processed.m4a")
+        let processedURL = dir.appendingPathComponent(RecordingStore.processedAudioName)
         if let size = try? processedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
           totalBytes += size
         }
@@ -472,14 +687,139 @@ struct SettingsView: View {
 
   // MARK: - Folder Picker
 
+  /// Offers to bring existing recordings along. Changing the folder used to
+  /// write the new path and return, so the library looked emptied, and any
+  /// in-flight transcription job in the old folder was never resumed - leaving
+  /// its audio on Soniox.
+  /// Never runs while a recording is live. `moveItem` succeeds on a directory
+  /// whose file is open for writing, and across volumes it is copy-then-delete:
+  /// measured, that leaves the destination holding only the part written before
+  /// the move, deletes the original, and the writer still reports success. The
+  /// recorder captures its save directory when it starts, so it would keep
+  /// writing to an inode with no name.
+  private func moveRecordings(from source: URL, to destination: URL) {
+    // `pickFolder` already committed the destination. Every early return below
+    // has to put the source back: the recordings and any job sidecar stay there,
+    // and launch-time resume and `recordingFinished` only look at the current one.
+    let revert = { saveDirectoryPath = source.path(percentEncoded: false) }
+    guard !monitor.isRecording, !monitor.isSaving else {
+      revert()
+      actionError = "Recording in progress. Existing recordings were left where they are."
+      return
+    }
+    // A job keeps the directory path it started with: after a move its sidecar
+    // writes fail and the post-fetch existence check discards a transcript that
+    // is already paid for.
+    guard !transcription.hasActiveJobs else {
+      revert()
+      actionError =
+        "Transcription in progress. Existing recordings were left where they are - move them after it finishes."
+      return
+    }
+    Task.detached {
+      var failed: [String] = []
+      // Recordings only: the save folder can be a shared one such as Documents,
+      // and everything else in it is not Blackbox's to move.
+      for directory in RecordingStore.recordingDirectories(in: source) {
+        let target = destination.appendingPathComponent(directory.lastPathComponent)
+        do {
+          try FileManager.default.moveItem(at: directory, to: target)
+        } catch {
+          // Was `try?`. This is the most destructive bulk operation in the app,
+          // and a partial move split the library across two folders silently.
+          failed.append(directory.lastPathComponent)
+          Log.error(
+            Log.app, "settings",
+            "could not move \(directory.lastPathComponent): \(error.localizedDescription)")
+        }
+      }
+      // The index is derived from the sidecars that just moved. Rebuild it in the
+      // new folder, and retire the old copy - or, when some recordings stayed
+      // behind, prune it down to just those.
+      await TranscriptIndex.backfill(in: destination)
+      if failed.isEmpty {
+        TranscriptIndex.removeDatabase(in: source)
+      } else {
+        await TranscriptIndex.backfill(in: source)
+      }
+      if !failed.isEmpty {
+        let names = failed
+        await MainActor.run {
+          actionError =
+            names.count == 1
+            ? "Could not move \"\(names[0])\". It is still in the old folder."
+            : "Could not move \(names.count) recordings. They are still in the old folder."
+        }
+      }
+    }
+  }
+
+  /// Offered grace-period values. A value stored by an older build that is not
+  /// one of these is added to the picker as its own entry rather than rounded
+  /// onto a neighbour, so no setting is rewritten behind the user's back.
+  private static let gracePeriodChoices: [Double] = [5, 10, 15, 30, 60]
+
+  private static func gracePeriodLabel(_ seconds: Double) -> String {
+    if seconds == 60 { return "1 minute" }
+    if seconds > 60, seconds.truncatingRemainder(dividingBy: 60) == 0 {
+      return "\(Int(seconds / 60)) minutes"
+    }
+    return "\(Int(seconds)) seconds"
+  }
+
   private func pickFolder() {
     let panel = NSOpenPanel()
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
     panel.allowsMultipleSelection = false
     panel.canCreateDirectories = true
-    if panel.runModal() == .OK, let url = panel.url {
-      saveDirectoryPath = url.path(percentEncoded: false)
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    let previous = URL(fileURLWithPath: saveDirectoryPath)
+    guard previous.path != url.path else { return }
+    saveDirectoryPath = url.path(percentEncoded: false)
+    if !RecordingStore.recordingDirectories(in: previous).isEmpty {
+      pendingMove = (from: previous, to: url)
+    }
+  }
+
+  // MARK: - API Key Verification
+
+  private enum APIKeyCheck: Equatable {
+    case untested
+    case checking
+    case valid
+    case invalid(String)
+  }
+
+  @ViewBuilder private var keyCheckLabel: some View {
+    switch keyCheck {
+    case .untested:
+      EmptyView()
+    case .checking:
+      ProgressView().controlSize(.small).accessibilityLabel("Checking key")
+    case .valid:
+      Label("Key works", systemImage: "checkmark.circle.fill")
+        .font(.caption)
+        .foregroundStyle(.green)
+    case .invalid(let message):
+      Label(message, systemImage: "exclamationmark.triangle.fill")
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .lineLimit(2)
+    }
+  }
+
+  private func verifyAPIKey() {
+    // Trimmed, like the value that actually gets stored and sent. A pasted key
+    // routinely carries a trailing newline, so the one control built to
+    // diagnose that was the one control that reproduced it - reporting the key
+    // invalid while transcription worked fine.
+    let key = sonioxAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    keyCheck = .checking
+    Task {
+      let result = await TranscriptionService.verifyAPIKey(key)
+      guard key == sonioxAPIKey.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+      keyCheck = result.isValid ? .valid : .invalid(result.message ?? "Key rejected")
     }
   }
 
@@ -487,10 +827,15 @@ struct SettingsView: View {
 
   private func migrateAPIKeyToKeychain() {
     let defaults = UserDefaults.standard
-    if let legacyKey = defaults.string(forKey: "sonioxAPIKey"), !legacyKey.isEmpty {
-      KeychainHelper.setString(legacyKey, forKey: "sonioxAPIKey")
-      defaults.removeObject(forKey: "sonioxAPIKey")
+    if let legacyKey = defaults.string(forKey: SettingsKeys.sonioxAPIKey), !legacyKey.isEmpty {
+      KeychainHelper.setString(legacyKey, forKey: SettingsKeys.sonioxAPIKey)
+      defaults.removeObject(forKey: SettingsKeys.sonioxAPIKey)
       sonioxAPIKey = legacyKey
+      // Invalidated here rather than through `onChange`: the Keychain is written
+      // first, so by the time the assignment above lands the guard there sees no
+      // change and returns. Without this the coordinator keeps the "no key"
+      // result it cached at launch until the next restart.
+      transcription.apiKeyChanged()
     }
   }
 }
@@ -500,13 +845,8 @@ struct SettingsView: View {
 @MainActor
 enum KeychainHelper {
   private static let service = "com.tenequm.Blackbox"
-  private static var cachedValues: [String: String] = [:]
-  private static var missingKeys: Set<String> = []
 
   static func string(forKey key: String) -> String? {
-    if let value = cachedValues[key] { return value }
-    if missingKeys.contains(key) { return nil }
-
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
@@ -517,37 +857,90 @@ enum KeychainHelper {
     guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
       let data = result as? Data,
       let value = String(data: data, encoding: .utf8)
-    else {
-      missingKeys.insert(key)
-      return nil
-    }
-    cachedValues[key] = value
+    else { return nil }
     return value
   }
 
-  static func setString(_ value: String, forKey key: String) {
-    if value.isEmpty {
-      cachedValues.removeValue(forKey: key)
-      missingKeys.insert(key)
-    } else {
-      cachedValues[key] = value
-      missingKeys.remove(key)
-    }
-
+  /// Returns false when the key was not stored. Both status codes used to be
+  /// discarded, so a rejected save left the field showing a key that was never
+  /// written and the next transcription failed to authenticate with nothing in
+  /// the log to say why.
+  @discardableResult
+  static func setString(_ value: String, forKey key: String) -> Bool {
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
       kSecAttrAccount as String: key,
     ]
-    SecItemDelete(query as CFDictionary)
-    if !value.isEmpty {
-      var attrs = query
-      attrs[kSecValueData as String] = Data(value.utf8)
-      SecItemAdd(attrs as CFDictionary, nil)
+    let deleteStatus = SecItemDelete(query as CFDictionary)
+    guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+      Log.error(Log.app, "keychain", "could not clear \(key): OSStatus \(deleteStatus)")
+      return false
     }
+    guard !value.isEmpty else { return true }
+    var attrs = query
+    attrs[kSecValueData as String] = Data(value.utf8)
+    // Readable only while the device is unlocked, and never migrated to another
+    // Mac by a backup restore - this is a credential that bills.
+    attrs[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    let addStatus = SecItemAdd(attrs as CFDictionary, nil)
+    guard addStatus == errSecSuccess else {
+      Log.error(Log.app, "keychain", "could not store \(key): OSStatus \(addStatus)")
+      return false
+    }
+    return true
   }
 }
 
-let defaultTranscriptionLanguages = "ru"
+nonisolated let defaultTranscriptionLanguages = "ru"
+
+/// The System Settings panes this app sends people to. The URL was spelled out
+/// at five call sites across three files, four of them force-unwrapping a
+/// hand-typed scheme.
+nonisolated enum PrivacyPane: String {
+  case screenCapture = "Privacy_ScreenCapture"
+  case microphone = "Privacy_Microphone"
+
+  var url: URL? {
+    URL(
+      string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(rawValue)")
+  }
+}
+
+@MainActor func openPrivacySettings(pane: PrivacyPane) {
+  guard let url = pane.url else { return }
+  NSWorkspace.shared.open(url)
+}
+
 let defaultSaveDirectoryPath =
   NSHomeDirectory() + "/Library/Application Support/Blackbox/Recordings"
+
+/// UserDefaults and Keychain keys shared across the app. Spelled out in one
+/// place because a typo in a key literal compiles and then reads back a
+/// default: the feature it gates stops working with nothing in the log.
+nonisolated enum SettingsKeys {
+  static let autoRecord = "autoRecord"
+  static let gracePeriod = "gracePeriod"
+  static let micEnabled = "micEnabled"
+  static let saveDirectoryPath = "saveDirectoryPath"
+  static let namePrefixTemplate = "namePrefixTemplate"
+  static let notifyOnStart = "notifyOnStart"
+  static let notifyOnSaved = "notifyOnSaved"
+  static let notifyOnError = "notifyOnError"
+  static let excludedBundleIDs = "excludedBundleIDs"
+  static let autoTranscribe = "autoTranscribe"
+  static let sonioxModel = "sonioxModel"
+  static let sonioxAPIKey = "sonioxAPIKey"
+  static let playbackRate = "playbackRate"
+  static let mainWindowTab = "mainWindowTab"
+  static let excludedTitlePatterns = "excludedTitlePatterns"
+  static let writeMixedTrack = "writeMixedTrack"
+  static let transcriptionLanguages = "transcriptionLanguages"
+  static let transcribeSeparateTracks = "transcribeSeparateTracks"
+  static let transcriptionDiarization = "transcriptionDiarization"
+  static let transcriptionLanguageHintsStrict = "transcriptionLanguageHintsStrict"
+  static let transcriptionLanguageIdentification = "transcriptionLanguageIdentification"
+  static let transcriptionContextGeneral = "transcriptionContextGeneral"
+  static let transcriptionContextTerms = "transcriptionContextTerms"
+  static let transcriptionContextText = "transcriptionContextText"
+}
