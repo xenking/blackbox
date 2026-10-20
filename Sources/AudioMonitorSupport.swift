@@ -182,6 +182,10 @@ struct AudioMonitorDependencies {
   /// `deletingLastPathComponent()` once enqueued the whole recordings folder
   /// as a job.
   var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
+  /// Called before the post-stop mixdown, with the same directory
+  /// `onRecordingSaved` will get after it. Lets a consumer persist its intent
+  /// without acting on a file that is about to be replaced.
+  var onRecordingPending: @MainActor (URL) -> Void = { _ in }
   /// Whether Screen Recording - which is what system audio capture rides on -
   /// is currently granted. Polled rather than inferred from a failed recording:
   /// the menu bar used to look healthy until the first recording failed, which

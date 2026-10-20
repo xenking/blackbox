@@ -65,7 +65,7 @@ struct TranscriptionConfigTests {
 
     #expect(
       TranscriptionConfig.fromDefaults(defaults)
-        == TranscriptionConfig(languageHints: ["ru"]))
+        == TranscriptionConfig(languageHints: ["ru"], model: TranscriptionService.defaultModel))
 
     defaults.set("en, de", forKey: SettingsKeys.transcriptionLanguages)
     defaults.set("off", forKey: SettingsKeys.transcriptionDiarization)

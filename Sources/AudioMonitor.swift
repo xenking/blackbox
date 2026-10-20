@@ -375,6 +375,10 @@ final class AudioMonitor {
   {
     guard let recordingDirectory else { return }
     if renderingMixdown {
+      // Before the mixdown, which can outlast the quit budget: the consumer
+      // records its intent to transcribe now, so a process that dies mid-render
+      // still has a job record for the next launch to resume.
+      dependencies.onRecordingPending(recordingDirectory)
       await TrackMixdown.render(
         recordingDirectory: recordingDirectory, includeMixedTrack: writeMixedTrack)
     }

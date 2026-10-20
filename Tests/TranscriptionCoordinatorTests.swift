@@ -65,6 +65,8 @@ actor FakeTranscriptionService: TranscriptionServicing {
   func setCompletionErrors(_ errors: [Error]) { completionErrors = errors }
   func setHoldsCompletion(_ holds: Bool) { holdsCompletion = holds }
   func setAfterUpload(_ handler: (@Sendable () async -> Void)?) { afterUpload = handler }
+  private var afterCreate: (@Sendable () async -> Void)?
+  func setAfterCreate(_ handler: (@Sendable () async -> Void)?) { afterCreate = handler }
 
   private var holdsUpload = false
   private(set) var uploadsInFlight = 0
@@ -148,6 +150,7 @@ actor FakeTranscriptionService: TranscriptionServicing {
     references.append(reference)
     createdRoles.append(role)
     configs.append(config)
+    await afterCreate?()
     return "transcription-\(createCount)"
   }
 
@@ -203,6 +206,7 @@ final class TranscriptionHarness {
   var uploadConcurrency = 2
   /// Read when a job is first planned; a job that has already paid ignores it.
   var languageHints = ["ru"]
+  var model: String?
 
   init() throws {
     root = FileManager.default.temporaryDirectory
@@ -231,7 +235,7 @@ final class TranscriptionHarness {
         apiKey: { [weak self] in self?.apiKey ?? nil },
         isAutoEnabled: { [weak self] in self?.autoEnabled ?? false },
         transcriptionOptions: { [weak self] in
-          TranscriptionConfig(languageHints: self?.languageHints ?? ["ru"])
+          TranscriptionConfig(languageHints: self?.languageHints ?? ["ru"], model: self?.model)
         },
         saveDirectory: { [root] in root },
         sleep: { [sleepHandler] duration in await sleepHandler(duration) },
@@ -1556,5 +1560,96 @@ struct TranscriptionCoordinatorTests {
     #expect(job.config == nil)
     #expect(job.effectiveConfig.languageHints == ["en", "fr"])
     #expect(job.effectiveConfig.separateTracks)
+  }
+
+  // MARK: - Review fixes
+
+  @Test("turning auto-transcription off between two uploads stops the second and deletes the first")
+  func consentWithdrawnBetweenUploads() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setPlannedRoles([.mic, .farEnd])
+    await harness.service.setAfterUpload { @MainActor [harness] in harness.autoEnabled = false }
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: directory)
+    await harness.wait { await harness.service.deletedFileIds == ["file-1"] }
+
+    #expect(await harness.service.uploadedRoles == [.mic])
+    #expect(await harness.service.createCount == 0)
+  }
+
+  @Test("turning auto-transcription off after the first part is billed does not bill the second")
+  func consentWithdrawnBetweenCreates() async throws {
+    let harness = try TranscriptionHarness()
+    await harness.service.setPlannedRoles([.mic, .farEnd])
+    await harness.service.setAfterCreate { @MainActor [harness] in harness.autoEnabled = false }
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingFinished(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.createdRoles == [.mic])
+    // The part that was billed still delivers; the unbilled upload is cleaned up.
+    #expect(TranscriptDocument.load(for: directory) != nil)
+    #expect(Set(await harness.service.deletedFileIds) == ["file-1", "file-2"])
+  }
+
+  @Test("a job record that cannot be written stops the job before it bills")
+  func unwritableRecordStopsBeforeBilling() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+    await harness.service.setAfterUpload {
+      // The disk fills, or the folder turns read-only, mid-job.
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o555], ofItemAtPath: directory.path)
+    }
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o755], ofItemAtPath: directory.path)
+    }
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait {
+      if case .error = coordinator.status(for: directory) { return true }
+      return false
+    }
+
+    #expect(await harness.service.createCount == 0)
+    #expect(await harness.service.deletedFileIds == ["file-1"])
+  }
+
+  @Test("a transcript is stamped with the model its parts were created with")
+  func modelFrozenWithPlan() async throws {
+    let harness = try TranscriptionHarness()
+    harness.model = "stt-old"
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.transcribe(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+
+    #expect(await harness.service.configs.map(\.model) == ["stt-old"])
+    #expect(TranscriptDocument.load(for: directory)?.model == "stt-old")
+  }
+
+  @Test("a recording pending its mixdown has a job record but does not start or resume")
+  func pendingRecordingIsReservedNotRun() async throws {
+    let harness = try TranscriptionHarness()
+    let directory = try harness.makeRecording("call-1")
+    let coordinator = harness.makeCoordinator()
+
+    coordinator.recordingPending(recordingDirectory: directory)
+    coordinator.resumePendingJobs()
+    try await Task.sleep(for: .milliseconds(150))
+
+    #expect(TranscriptionJob.load(for: directory)?.isAutomatic == true)
+    #expect(await harness.service.uploadCount == 0)
+
+    coordinator.recordingFinished(recordingDirectory: directory)
+    await harness.wait { coordinator.status(for: directory) == .completed }
+    #expect(await harness.service.uploadCount == 1)
   }
 }

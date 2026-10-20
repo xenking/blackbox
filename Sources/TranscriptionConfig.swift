@@ -58,11 +58,17 @@ nonisolated struct TranscriptionConfig: Codable, Sendable, Equatable {
   var diarization: Bool?
   var separateTracks: Bool = true
   var context = SonioxContext()
+  /// Resolved when the job is planned and then frozen with it, so a model
+  /// changed in Settings mid-job does not split one recording across two
+  /// models. Nil means "the service's current model" (jobs from before this
+  /// field, and tests).
+  var model: String?
 
   init(
     languageHints: [String], languageHintsStrict: Bool = false,
     languageIdentification: Bool = true, diarization: Bool? = nil,
-    separateTracks: Bool = true, context: SonioxContext = SonioxContext()
+    separateTracks: Bool = true, context: SonioxContext = SonioxContext(),
+    model: String? = nil
   ) {
     self.languageHints = languageHints
     self.languageHintsStrict = languageHintsStrict
@@ -70,6 +76,7 @@ nonisolated struct TranscriptionConfig: Codable, Sendable, Equatable {
     self.diarization = diarization
     self.separateTracks = separateTracks
     self.context = context
+    self.model = model
   }
 
   /// Hand-written so a job record written before a field existed still decodes:
@@ -85,6 +92,7 @@ nonisolated struct TranscriptionConfig: Codable, Sendable, Equatable {
     diarization = try container.decodeIfPresent(Bool.self, forKey: .diarization)
     separateTracks = try container.decodeIfPresent(Bool.self, forKey: .separateTracks) ?? true
     context = try container.decodeIfPresent(SonioxContext.self, forKey: .context) ?? SonioxContext()
+    model = try container.decodeIfPresent(String.self, forKey: .model)
   }
 
   /// Settings -> config. `ru`, split tracks, language identification on and no
@@ -109,6 +117,7 @@ nonisolated struct TranscriptionConfig: Codable, Sendable, Equatable {
       context: SonioxContext(
         generalLines: defaults.string(forKey: SettingsKeys.transcriptionContextGeneral) ?? "",
         terms: defaults.string(forKey: SettingsKeys.transcriptionContextTerms) ?? "",
-        text: defaults.string(forKey: SettingsKeys.transcriptionContextText) ?? ""))
+        text: defaults.string(forKey: SettingsKeys.transcriptionContextText) ?? ""),
+      model: TranscriptionService.resolvedModel(defaults.string(forKey: SettingsKeys.sonioxModel)))
   }
 }

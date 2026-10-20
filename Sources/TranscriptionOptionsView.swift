@@ -116,7 +116,9 @@ struct TranscriptionOptionsSheet: View {
       diarization: diarization == "on" ? true : diarization == "off" ? false : nil,
       separateTracks: separateTracks,
       context: SonioxContext(
-        generalLines: contextGeneral, terms: contextTerms, text: contextText))
+        generalLines: contextGeneral, terms: contextTerms, text: contextText),
+      model: TranscriptionService.resolvedModel(
+        UserDefaults.standard.string(forKey: SettingsKeys.sonioxModel)))
   }
 
   var body: some View {

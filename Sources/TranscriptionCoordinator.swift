@@ -19,11 +19,18 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
     /// Uploaded file. Storage only: uploading is not what gets billed.
     var fileId: String?
     var transcriptionId: String?
+    /// The model this part was created with. Stamped onto its transcript, so a
+    /// model changed in Settings between create and fetch is not misreported.
+    var model: String?
 
-    init(role: TranscriptionJobRole, fileId: String? = nil, transcriptionId: String? = nil) {
+    init(
+      role: TranscriptionJobRole, fileId: String? = nil, transcriptionId: String? = nil,
+      model: String? = nil
+    ) {
       self.role = role
       self.fileId = fileId
       self.transcriptionId = transcriptionId
+      self.model = model
     }
   }
 
@@ -156,17 +163,24 @@ nonisolated struct TranscriptionJob: Codable, Sendable {
   /// naming what a job has put on Soniox, so losing a write is how audio ends up
   /// stranded there with nothing left to identify it.
   func save(for recordingDirectory: URL) {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     do {
-      let data = try encoder.encode(self)
-      try data.write(to: Self.url(for: recordingDirectory), options: .atomic)
+      try write(for: recordingDirectory)
     } catch {
       Log.error(
         Log.transcription, "transcription",
         "failed to write the transcription job record for \(recordingDirectory.lastPathComponent): \(error.localizedDescription)"
       )
     }
+  }
+
+  /// For the writes that gate remote work: a plan, an uploaded file id, a
+  /// created transcription id. Those must not be followed by another upload or
+  /// create if the record naming them did not reach disk - a crash then makes
+  /// the next launch bill the same audio again with the first artifact orphaned.
+  func write(for recordingDirectory: URL) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(self).write(to: Self.url(for: recordingDirectory), options: .atomic)
   }
 }
 
@@ -437,12 +451,27 @@ final class TranscriptionCoordinator {
   /// next recording deduped against it, and `RecordingStore.audioURL(in:)`
   /// transcribed whatever stray audio happened to sit at the top level.
   func recordingFinished(recordingDirectory: URL) {
-    guard dependencies.isAutoEnabled() else { return }
+    guard shouldAutoTranscribe(recordingDirectory) else { return }
+    enqueue(recordingDirectory, isAutomatic: true)
+  }
+
+  /// Persists the intent to transcribe a recording that is not ready yet - its
+  /// post-stop mixdown is still rewriting `audio.m4a` - without starting
+  /// anything. If the process dies before `recordingFinished`, the next launch
+  /// finds the sidecar and resumes against the playable 2-track file, instead of
+  /// the recording silently never being transcribed.
+  func recordingPending(recordingDirectory: URL) {
+    guard shouldAutoTranscribe(recordingDirectory) else { return }
+    enqueue(recordingDirectory, isAutomatic: true, startNow: false)
+  }
+
+  private func shouldAutoTranscribe(_ recordingDirectory: URL) -> Bool {
+    guard dependencies.isAutoEnabled() else { return false }
     guard apiKey() != nil else {
       Log.info(
         Log.transcription, "transcription",
         "auto-transcribe is on but no API key is configured; skipping")
-      return
+      return false
     }
     // A recording directory always sits directly inside the save directory.
     // Anything else means the caller handed over the wrong level, and the cost
@@ -457,9 +486,9 @@ final class TranscriptionCoordinator {
         Log.transcription, "transcription",
         "not auto-transcribing \(recordingDirectory.lastPathComponent): it is not in the current save folder (\(saveDirectory.path))"
       )
-      return
+      return false
     }
-    enqueue(recordingDirectory, isAutomatic: true)
+    return true
   }
 
   /// Manual trigger from the recording detail view, including retry after a
@@ -564,7 +593,9 @@ final class TranscriptionCoordinator {
       for recordingDirectory in pending {
         // Read fresh, and skip anything already in flight: the user can have
         // hit Retry on one of these while the sweep above was running.
-        guard self.jobs[recordingDirectory.path] == nil else { continue }
+        guard self.jobs[recordingDirectory.path] == nil,
+          !self.reserved.contains(recordingDirectory.path)
+        else { continue }
         guard let job = TranscriptionJob.load(for: recordingDirectory) else {
           // `save` logs its write failures; this is the read side of that pair.
           // A record that will not decode is skipped on every launch, and its
@@ -609,8 +640,14 @@ final class TranscriptionCoordinator {
 
   // MARK: - Queue
 
+  /// Recordings whose sidecar exists but whose job must not start yet. Resume
+  /// skips them: it would otherwise start a job against a file the post-stop
+  /// mixdown is still replacing.
+  private var reserved: Set<String> = []
+
   private func enqueue(
-    _ recordingDirectory: URL, isAutomatic: Bool, configOverride: TranscriptionConfig? = nil
+    _ recordingDirectory: URL, isAutomatic: Bool, configOverride: TranscriptionConfig? = nil,
+    startNow: Bool = true
   ) {
     let key = recordingDirectory.path
     // Ahead of the in-flight guard on purpose: an explicit request has to
@@ -629,6 +666,11 @@ final class TranscriptionCoordinator {
         .save(for: recordingDirectory)
     }
     statuses[key] = .queued
+    guard startNow else {
+      reserved.insert(key)
+      return
+    }
+    reserved.remove(key)
     // The sidecar is written either way, so a recording reported during quit is
     // picked up by the next launch rather than lost.
     guard !isSuspended else { return }
@@ -726,7 +768,7 @@ final class TranscriptionCoordinator {
           job.parts = roles.map { TranscriptionJob.Part(role: $0) }
           job.languageHints = options.languageHints
           job.config = options
-          job.save(for: recordingDirectory)
+          try job.write(for: recordingDirectory)
         }
 
         if job.parts.contains(where: { $0.fileId == nil && $0.transcriptionId == nil }) {
@@ -766,6 +808,19 @@ final class TranscriptionCoordinator {
           // bounds, and each id is saved before the next upload starts.
           for index in job.parts.indices
           where job.parts[index].fileId == nil && job.parts[index].transcriptionId == nil {
+            // Per part, not per job: the previous part's upload took minutes,
+            // and the setting can go off in that window.
+            if job.isAutomatic, !dependencies.isAutoEnabled() {
+              if !job.isBilled {
+                Log.info(
+                  Log.transcription, "transcription",
+                  "dropping auto-transcription for \(name) between uploads: the setting is now off"
+                )
+                drop(job: job, in: recordingDirectory)
+                return
+              }
+              break
+            }
             job.parts[index].fileId = try await service.upload(
               fileURL: audioURL, role: job.parts[index].role
             ) { [weak self] phase in
@@ -773,7 +828,7 @@ final class TranscriptionCoordinator {
                 self?.recordUploadProgress(phase, for: key)
               }
             }
-            job.save(for: recordingDirectory)
+            try job.write(for: recordingDirectory)
           }
         }
         // Checked again here rather than only at the top of the pass: `upload`
@@ -789,6 +844,29 @@ final class TranscriptionCoordinator {
         // Sequential, each id saved before the next create: a failure on the
         // second part must not lose the first, which is already billed.
         for index in job.parts.indices where job.parts[index].transcriptionId == nil {
+          // Per part. `isConsentWithdrawn` goes quiet once any part is billed,
+          // so without this a setting turned off after the first create still
+          // bills the second. Parts already billed finish; the rest is not run.
+          if job.isAutomatic, !dependencies.isAutoEnabled() {
+            if !job.isBilled {
+              Log.info(
+                Log.transcription, "transcription",
+                "dropping auto-transcription for \(name) before billing: the setting is now off")
+              drop(job: job, in: recordingDirectory)
+              return
+            }
+            Log.info(
+              Log.transcription, "transcription",
+              "auto-transcription turned off after \(job.transcriptionIds.count) billed part(s) for \(name); not billing the rest"
+            )
+            // Their uploaded files are deleted rather than forgotten: once the
+            // parts leave the record nothing else names them.
+            discardRemote(
+              job: TranscriptionJob(parts: job.parts.filter { $0.transcriptionId == nil }))
+            job.parts.removeAll { $0.transcriptionId == nil }
+            try job.write(for: recordingDirectory)
+            break
+          }
           guard let fileId = job.parts[index].fileId else {
             fail(&job, in: recordingDirectory, message: "Soniox returned no file id")
             return
@@ -797,7 +875,8 @@ final class TranscriptionCoordinator {
           job.parts[index].transcriptionId = try await service.createTranscription(
             fileId: fileId, reference: name, role: job.parts[index].role,
             config: job.effectiveConfig)
-          job.save(for: recordingDirectory)
+          job.parts[index].model = job.effectiveConfig.model
+          try job.write(for: recordingDirectory)
         }
 
         statuses[key] = .transcribing
@@ -897,10 +976,9 @@ final class TranscriptionCoordinator {
         group.addTask {
           do {
             try await service.awaitCompletion(transcriptionId: transcriptionId)
-            return (
-              part.role,
-              .success(try await service.fetchTranscript(transcriptionId: transcriptionId))
-            )
+            var document = try await service.fetchTranscript(transcriptionId: transcriptionId)
+            if let model = part.model { document.model = model }
+            return (part.role, .success(document))
           } catch TranscriptionError.noSpeechDetected {
             // Silence on one side of the call is ordinary - a muted mic - and
             // says nothing about the other side.

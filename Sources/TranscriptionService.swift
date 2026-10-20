@@ -978,7 +978,7 @@ nonisolated final class TranscriptionService: TranscriptionServicing {
     config: TranscriptionConfig
   ) -> [String: Any] {
     var body: [String: Any] = [
-      "model": model,
+      "model": config.model ?? model,
       "file_id": fileId,
       "language_hints": config.languageHints,
       "enable_speaker_diarization": config.diarization ?? diarizes(role),

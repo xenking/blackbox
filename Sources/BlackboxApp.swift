@@ -33,6 +33,9 @@ struct BlackboxApp: App {
       dependencies.onRecordingSaved = { [weak coordinator] url in
         coordinator?.recordingFinished(recordingDirectory: url)
       }
+      dependencies.onRecordingPending = { [weak coordinator] url in
+        coordinator?.recordingPending(recordingDirectory: url)
+      }
     }
     let monitor = AudioMonitor(dependencies: dependencies)
 
