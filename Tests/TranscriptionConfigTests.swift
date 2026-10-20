@@ -392,4 +392,47 @@ struct TranscriptIndexTests {
       try rows(root, "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH 'kept'") == [["0"]]
     )
   }
+
+  @Test("an index from a newer build is left untouched, not stamped back")
+  func newerSchemaIsNotDowngraded() async throws {
+    let root = try makeRoot()
+    let directory = try makeRecording(in: root, "a")
+    var db: OpaquePointer?
+    #expect(sqlite3_open(TranscriptIndex.databaseURL(in: root).path, &db) == SQLITE_OK)
+    #expect(
+      sqlite3_exec(
+        db, "CREATE TABLE future(x); PRAGMA user_version = 3;", nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(db)
+
+    await TranscriptIndex.upsert(
+      recordingDirectory: directory, document: document(["x"]), config: nil)
+
+    #expect(try rows(root, "PRAGMA user_version") == [["3"]])
+    #expect(try rows(root, "SELECT name FROM sqlite_master WHERE name = 'transcripts'") == [])
+  }
+
+  @Test("a rename that rebuilds the metadata refreshes the structured meeting fields too")
+  func refreshUpdatesAppWindowAndBundle() async throws {
+    let root = try makeRoot()
+    let directory = root.appendingPathComponent("a")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try RecordingMetadata(
+      title: "T", createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+      appName: RecordingNaming.compose(app: "Google Chrome", windowTitle: "Weekly | Meet"),
+      speakers: [:], perAppBundleID: "com.google.Chrome"
+    ).save(in: directory)
+    await TranscriptIndex.upsert(
+      recordingDirectory: directory, document: document(["x"]), config: nil)
+
+    // Metadata rebuilt after being lost: a different app name and no bundle id.
+    try RecordingMetadata(
+      title: "T", createdAt: Date(timeIntervalSince1970: 1_700_000_000), appName: "Zoom",
+      speakers: [:]
+    ).save(in: directory)
+    await TranscriptIndex.refreshMetadata(recordingDirectory: directory)
+
+    #expect(
+      try rows(root, "SELECT app_name, app, window_title, bundle_id FROM transcripts")
+        == [["Zoom", "Zoom", "NULL", "NULL"]])
+  }
 }

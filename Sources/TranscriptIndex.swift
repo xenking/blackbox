@@ -123,11 +123,21 @@ nonisolated enum TranscriptIndex {
       in: recordingDirectory.deletingLastPathComponent()
     ) { db in
       let metadata = RecordingMetadata.load(in: recordingDirectory)
+      // `app`, `window_title` and `bundle_id` are derived from `app_name` and the bundle id, so
+      // they move with it. A metadata file that was missing or corrupt and got rebuilt by a
+      // rename carries a different app name and no bundle id; updating only `app_name` left the
+      // structured fields describing a meeting the row no longer names.
+      let naming = metadata.map { RecordingNaming.split($0.appName) }
       try exec(
-        db, "UPDATE transcripts SET title = ?, app_name = ?, speakers_json = ? WHERE recording = ?",
+        db,
+        """
+        UPDATE transcripts SET title = ?, app_name = ?, app = ?, window_title = ?, bundle_id = ?,
+          speakers_json = ? WHERE recording = ?
+        """,
         [
           metadata?.title ?? recordingDirectory.lastPathComponent, metadata?.appName,
-          speakersJSON(metadata), recordingDirectory.lastPathComponent,
+          naming?.app, naming?.windowTitle, metadata?.perAppBundleID, speakersJSON(metadata),
+          recordingDirectory.lastPathComponent,
         ])
     }
   }
@@ -280,6 +290,15 @@ nonisolated enum TranscriptIndex {
       try exec(db, "PRAGMA foreign_keys = ON", [])
       var current = -1
       try query(db, "PRAGMA user_version", []) { current = Int(sqlite3_column_int64($0, 0)) }
+      // A newer build already owns this database. Stamping it back to this build's version would
+      // let the bundled MCP server query a schema it does not understand, and the newer build's
+      // own migration would then run against tables it already migrated. Leave it untouched.
+      if current > schemaVersion {
+        throw SQLiteError(
+          description:
+            "transcript index is schema v\(current), newer than the v\(schemaVersion) this build understands; leaving it untouched"
+        )
+      }
       if current != schemaVersion {
         // One transaction for migrate + DDL + the version stamp: a reader (the MCP server)
         // must never see the tables without the version, which reads as "not ready".

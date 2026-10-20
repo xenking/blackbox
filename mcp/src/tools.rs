@@ -109,6 +109,12 @@ impl Server {
     /// reported as a tool error the model can read and relay.
     fn with(&self, f: impl FnOnce(&Connection) -> Result<Value, StoreError>) -> ToolResult {
         let outcome = self.store.open().and_then(|conn| {
+            // One read transaction for the whole call. In WAL mode each autocommit statement
+            // gets its own snapshot, so with the app committing an upsert between two SELECTs a
+            // response could pair old metadata with new segments, or a total with other rows.
+            // BEGIN is deferred: the snapshot is taken by the first SELECT and held until `conn`
+            // drops and rolls back, including the freshness query below.
+            conn.execute_batch("BEGIN")?;
             let body = f(&conn)?;
             let freshness = one(
                 &conn,
@@ -372,5 +378,62 @@ impl From<StoreError> for ErrorData {
             StoreError::Invalid(m) => ErrorData::invalid_params(m, None),
             other => ErrorData::internal_error(other.to_string(), None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SCHEMA_VERSION;
+    use rusqlite::Connection;
+
+    /// The app commits an upsert between two statements of one tool call. Without a read
+    /// transaction the second SELECT sees the new row and the response contradicts itself.
+    #[test]
+    fn one_call_sees_one_committed_index_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcripts.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE transcripts(recording TEXT PRIMARY KEY, transcribed_at REAL);
+                 INSERT INTO transcripts VALUES ('a', 1.0);
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
+            .unwrap();
+        let server = Server::new(Store::new(Some(path)));
+
+        let result = server
+            .with(|conn| {
+                let count = |c: &Connection| {
+                    c.query_row("SELECT count(*) FROM transcripts", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+                };
+                let before = count(conn);
+                writer
+                    .execute("INSERT INTO transcripts VALUES ('b', 2.0)", [])
+                    .unwrap();
+                Ok(json!({ "before": before, "after": count(conn) }))
+            })
+            .unwrap();
+
+        let payload = &result.structured_content.unwrap();
+        assert_eq!(
+            payload["result"],
+            json!({ "before": 1, "after": 1 }),
+            "one snapshot per call"
+        );
+        // The freshness figure in the same response comes from that snapshot too.
+        assert_eq!(payload["index"]["recordings"], json!(1));
+        // The next call sees the commit.
+        let next = server
+            .with(|_| Ok(Value::Null))
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(next["index"]["recordings"], json!(2));
     }
 }

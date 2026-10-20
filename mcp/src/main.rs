@@ -167,6 +167,11 @@ fn print_config(show_token: bool) -> anyhow::Result<()> {
     } else {
         "<token>".to_string()
     };
+    if let Err(why) = agent::reject_ephemeral_path(&binary) {
+        println!(
+            "# WARNING: the stdio command below points at a temporary location, so it will stop working.\n# {why}\n"
+        );
+    }
     if !status.installed {
         println!(
             "# The HTTP agent is not installed: run `blackbox-mcp install-agent` first (stdio below works without it).\n"

@@ -218,13 +218,25 @@ pub fn install(
     Ok(())
 }
 
+/// What `launchctl bootout` says when the service is simply not loaded: exit 3 "No such
+/// process" (measured), or 113 "Could not find service".
+fn not_loaded(output: &str) -> bool {
+    output.contains("No such process") || output.contains("Could not find")
+}
+
 pub fn uninstall(
     paths: &Paths,
     launchctl: &dyn Launchctl,
     uid: &str,
     keep_token: bool,
 ) -> anyhow::Result<()> {
-    let _ = launchctl.run(&["bootout", &format!("gui/{uid}/{LABEL}")]);
+    // Only "it was not loaded" is fine. Any other bootout failure leaves the KeepAlive job
+    // running from launchd's in-memory copy; deleting the plist and token then would report
+    // success while a server keeps listening and every client loses the token it needs.
+    let (ok, out) = launchctl.run(&["bootout", &format!("gui/{uid}/{LABEL}")]);
+    if !ok && !not_loaded(&out) {
+        bail!("launchctl bootout failed, nothing was removed: {out}");
+    }
     for file in std::iter::once(&paths.plist).chain((!keep_token).then_some(&paths.token)) {
         match fs::remove_file(file) {
             Ok(()) => {}
@@ -248,17 +260,28 @@ pub struct Status {
     pub log_file: String,
 }
 
+/// Undoes `xml`. `&amp;` goes last so `&amp;lt;` decodes to the literal text `&lt;`, not `<`.
+fn unxml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The executable the installed plist runs, XML-decoded - `render_plist` escapes it, and a
+/// path containing `&` (or `<`, `>`) would otherwise never match what is on disk.
+pub fn binary_from_plist(plist: &str) -> Option<String> {
+    let after = plist
+        .split("<key>ProgramArguments</key>")
+        .nth(1)?
+        .split("<string>")
+        .nth(1)?;
+    Some(unxml(after.split("</string>").next()?))
+}
+
 pub fn status(paths: &Paths, launchctl: &dyn Launchctl, uid: &str) -> Status {
     let plist = fs::read_to_string(&paths.plist).ok();
     let port = plist.as_deref().and_then(port_from_plist);
-    let binary = plist.as_deref().and_then(|p| {
-        let after = p
-            .split("<key>ProgramArguments</key>")
-            .nth(1)?
-            .split("<string>")
-            .nth(1)?;
-        Some(after.split("</string>").next()?.to_string())
-    });
+    let binary = plist.as_deref().and_then(binary_from_plist);
     let loaded = launchctl.run(&["print", &format!("gui/{uid}/{LABEL}")]).0;
     Status {
         installed: plist.is_some(),
@@ -301,10 +324,17 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<String>>,
         fail_bootstrap: bool,
+        /// What a failing `bootout` prints; None means it succeeds.
+        bootout_fails_with: Option<&'static str>,
     }
     impl Launchctl for Fake {
         fn run(&self, args: &[&str]) -> (bool, String) {
             self.calls.borrow_mut().push(args.join(" "));
+            if args[0] == "bootout"
+                && let Some(out) = self.bootout_fails_with
+            {
+                return (false, out.to_string());
+            }
             (
                 !(self.fail_bootstrap && args[0] == "bootstrap"),
                 String::new(),
@@ -405,6 +435,53 @@ mod tests {
             ]
         );
         assert!(!status.installed && status.port.is_none());
+    }
+
+    #[test]
+    fn a_path_with_xml_special_characters_round_trips_through_the_plist() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::under(home.path());
+        let dir = home.path().join("A&B <x>");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("blackbox-mcp");
+        fs::write(&binary, "").unwrap();
+        install(&paths, &Fake::default(), "501", &binary, 5555, None).unwrap();
+
+        // The plist holds the escaped form; status must decode it, or `binary_exists` is false
+        // and the app reports the agent as pointing at another copy forever.
+        let raw = fs::read_to_string(&paths.plist).unwrap();
+        assert!(raw.contains("A&amp;B &lt;x&gt;"), "{raw}");
+        let status = status(&paths, &Fake::default(), "501");
+        assert_eq!(status.binary.as_deref(), Some(binary.to_str().unwrap()));
+        assert!(status.binary_exists);
+        assert_eq!(unxml("&amp;lt;"), "&lt;", "decoding is not applied twice");
+    }
+
+    #[test]
+    fn uninstall_stops_when_the_job_cannot_be_unloaded_and_tolerates_not_loaded() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::under(home.path());
+        let binary = home.path().join("b");
+        fs::write(&binary, "").unwrap();
+        install(&paths, &Fake::default(), "501", &binary, 1, None).unwrap();
+
+        // A real failure: the KeepAlive job may still be running, so keep the plist and the
+        // token the clients need.
+        let broken = Fake {
+            bootout_fails_with: Some("Boot-out failed: 5: Input/output error"),
+            ..Fake::default()
+        };
+        let err = uninstall(&paths, &broken, "501", false).unwrap_err();
+        assert!(err.to_string().contains("nothing was removed"), "{err}");
+        assert!(paths.plist.exists() && paths.token.exists());
+
+        // The measured output when it was never loaded (exit 3) is fine.
+        let absent = Fake {
+            bootout_fails_with: Some("Boot-out failed: 3: No such process"),
+            ..Fake::default()
+        };
+        uninstall(&paths, &absent, "501", false).unwrap();
+        assert!(!paths.plist.exists() && !paths.token.exists());
     }
 
     #[test]

@@ -162,8 +162,9 @@ struct MCPServerSection: View {
           }
           Button("Remove") { Task { await controller.uninstall() } }
             .disabled(controller.status?.installed != true)
+          // Not gated on the agent: the stdio setup it prints needs no listener at all, and it
+          // is the recommended one for the Codex app.
           Button("Copy Client Setup") { Task { await controller.copyClientSetup() } }
-            .disabled(controller.status?.installed != true)
         }
         .disabled(controller.isBusy)
 
