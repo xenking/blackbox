@@ -230,6 +230,17 @@ final class TranscriptionCoordinator {
           fileURLWithPath: UserDefaults.standard.string(forKey: SettingsKeys.saveDirectoryPath)
             ?? defaultSaveDirectoryPath)
     }
+    /// Where the ids of Soniox artifacts that still have to be deleted are recorded once
+    /// their recording's own sidecar is gone or about to be reset. Outside the save folder on
+    /// purpose: that folder is user-configurable (it can be `~/Documents`), can be moved, and
+    /// is only scanned at its current location, so a ledger inside it is stranded by exactly
+    /// the actions it has to survive.
+    var cleanupDirectory: () -> URL = {
+      BlackboxTestMode.saveDirectoryOverride?.appendingPathComponent(".remote-cleanup")
+        ?? URL(
+          fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/Blackbox/RemoteCleanup"
+        )
+    }
     var sleep: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     var durationSeconds: @Sendable (URL) async -> Double? = {
       await TranscriptionCoordinator.assetDurationSeconds(of: $0)
@@ -532,19 +543,16 @@ final class TranscriptionCoordinator {
         // A cleanup left over from a session that had no key. There is one now
         // (guarded above), so it goes out immediately and the new job starts
         // from nothing rather than polling ids it is in the middle of deleting.
-        _ = discardRemote(job: job)
+        handOffToCleanup(job, for: recordingDirectory)
         job = TranscriptionJob()
       } else {
         // A failure that could not dispatch its cleanup kept its ids. Retry
         // them now, so the new run starts fresh instead of re-polling a
         // transcription this same click is about to delete.
-        if job.hasRemoteArtifacts, discardRemote(job: job) {
-          // Cleared on dispatch rather than on confirmation, unlike every other
-          // path here: the user is starting a new run, and a record still
-          // naming the old transcription would have that run polling ids this
-          // very click is deleting. A delete that then fails is logged and its
-          // artifacts orphaned - the one place that trade is made, and only on
-          // an explicit user action.
+        if job.hasRemoteArtifacts, handOffToCleanup(job, for: recordingDirectory) {
+          // Forgotten by the sidecar, not by the ledger: the new run must not
+          // poll ids this very click is deleting, but a DELETE that then fails
+          // (offline, key rejected) still has them recorded to retry from.
           job.clearRemoteIds()
         } else if !job.hasRemoteArtifacts {
           // Nothing paid for, so the run is planned afresh: the user may have
@@ -570,41 +578,51 @@ final class TranscriptionCoordinator {
     jobs[recordingDirectory.path] = nil
     statuses[recordingDirectory.path] = nil
     guard let job, job.hasRemoteArtifacts else { return }
-    // The sidecar naming the remote artifacts went to the Trash with the
-    // directory, so a delete that fails here (offline, key rejected) would have
-    // nothing left to retry from. The ids are recorded in the save folder first,
-    // where launch-time resume scans, and retired only once Soniox confirms.
-    let entry = Self.cleanupEntryURL(in: dependencies.saveDirectory(), for: recordingDirectory)
+    handOffToCleanup(job, for: recordingDirectory)
+  }
+
+  /// Records a job's remote artifacts in the cleanup ledger, then dispatches their delete;
+  /// the entry is removed only when Soniox confirms. The sidecar that named them is about to
+  /// vanish (the directory is trashed) or be reset (a retry), so without this a failed delete
+  /// would leave the uploaded call audio on Soniox with nothing naming it.
+  ///
+  /// Returns whether the caller may forget the ids: true once they are durably in the ledger,
+  /// or - if the ledger could not be written - when the delete was at least dispatched.
+  @discardableResult
+  private func handOffToCleanup(_ job: TranscriptionJob, for recordingDirectory: URL) -> Bool {
+    guard job.hasRemoteArtifacts else { return true }
+    let entry = Self.cleanupEntryURL(
+      in: dependencies.cleanupDirectory(), for: recordingDirectory)
     var pending = job
     pending.awaitingRemoteDelete = true
     pending.lastError = nil
+    var recorded = true
     do {
       try pending.write(to: entry)
     } catch {
+      recorded = false
       Log.error(
         Log.transcription, "transcription",
-        "could not record Soniox cleanup for the deleted recording \(recordingDirectory.lastPathComponent): \(error.localizedDescription)"
+        "could not record Soniox cleanup for \(recordingDirectory.lastPathComponent): \(error.localizedDescription)"
       )
     }
-    _ = discardRemote(job: job) { try? FileManager.default.removeItem(at: entry) }
+    let dispatched = discardRemote(job: job) {
+      try? FileManager.default.removeItem(at: entry)
+    }
+    return recorded || dispatched
   }
 
-  /// Hidden, so every directory scan (which skips dot-names) ignores it, and
-  /// kept in the save folder so it survives the recording going to the Trash.
-  nonisolated static let cleanupDirectoryName = ".remote-cleanup"
-
-  nonisolated static func cleanupEntryURL(in saveDirectory: URL, for recordingDirectory: URL) -> URL
+  nonisolated static func cleanupEntryURL(in cleanupDirectory: URL, for recordingDirectory: URL)
+    -> URL
   {
-    saveDirectory
-      .appendingPathComponent(cleanupDirectoryName, isDirectory: true)
-      .appendingPathComponent("\(recordingDirectory.lastPathComponent)-\(UUID().uuidString).json")
+    cleanupDirectory.appendingPathComponent(
+      "\(recordingDirectory.lastPathComponent)-\(UUID().uuidString).json")
   }
 
   /// Entries left by deleted recordings whose Soniox delete did not complete.
-  nonisolated static func pendingCleanupEntries(in saveDirectory: URL) -> [(
+  nonisolated static func pendingCleanupEntries(in directory: URL) -> [(
     url: URL, job: TranscriptionJob
   )] {
-    let directory = saveDirectory.appendingPathComponent(cleanupDirectoryName, isDirectory: true)
     guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
       return []
     }
@@ -646,12 +664,13 @@ final class TranscriptionCoordinator {
   func resumePendingJobs(sweepScratchFiles: Bool = true) {
     guard apiKey() != nil else { return }
     let directory = dependencies.saveDirectory()
+    let cleanupDirectory = dependencies.cleanupDirectory()
     let sweep = dependencies.sweepTemporaryFiles
     Task { [weak self] in
       if sweepScratchFiles { await sweep() }
       let pending = await Self.directoriesWithPendingJobs(in: directory)
       guard let self else { return }
-      for entry in Self.pendingCleanupEntries(in: directory) {
+      for entry in Self.pendingCleanupEntries(in: cleanupDirectory) {
         Log.info(
           Log.transcription, "transcription",
           "retrying Soniox cleanup for a deleted recording (\(entry.url.lastPathComponent))")

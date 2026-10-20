@@ -862,7 +862,7 @@ struct RecordingDetailView: View {
           }
           .accessibilityLabel("Transcribe Again")
           .help("Transcribe again - replaces the current transcript")
-          .disabled(transcriptionStatus.isActive)
+          .disabled(transcriptionStatus.isActive || !transcription.hasAPIKey)
 
           Button {
             showTranscriptionOptions = true
@@ -871,7 +871,7 @@ struct RecordingDetailView: View {
           }
           .accessibilityLabel("Transcribe With Options")
           .help("Transcribe with a different language, context or diarization")
-          .disabled(transcriptionStatus.isActive)
+          .disabled(transcriptionStatus.isActive || !transcription.hasAPIKey)
         }
 
         // A recording that captured nothing has no mic track to clean, so the

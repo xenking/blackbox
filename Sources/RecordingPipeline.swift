@@ -579,7 +579,9 @@ final class RecordingPipeline: @unchecked Sendable {
       diagnostics[track].buffersAppended += 1
     } else {
       diagnostics[track].buffersAppendFailed += 1
-      Log.warning(Log.recorder, "recorder", "\(track.rawValue) append failed for \(appName)")
+      Log.warning(
+        Log.recorder, "recorder",
+        "\(track.rawValue) append failed for \(RecordingNaming.split(appName).app)")
       reportWriterFailureIfNeeded()
     }
   }
