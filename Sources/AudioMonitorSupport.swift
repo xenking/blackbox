@@ -1,11 +1,14 @@
 import AVFoundation
 import AppKit
 import CoreAudio
+import CoreGraphics
 import UserNotifications
 
 protocol RecorderSession: AnyObject {
   var appName: String { get }
   func start() async throws
+  /// The recording *directory* that reached disk, or nil if nothing did.
+  /// Ask `RecordingStore.audioURL(in:)` for the audio inside it.
   func stop() async -> URL?
 }
 
@@ -58,6 +61,9 @@ protocol AudioMonitorHUD: AnyObject {
   func showRecordingStarted(appName: String)
   func showRecordingSaved(appName: String)
   func showError(message: String)
+  /// Shown for the duration of quit-time finalization; has no auto-hide.
+  func showFinalizing()
+  var lastToast: HUDToast? { get }
 }
 
 extension RecordingHUD: AudioMonitorHUD {}
@@ -127,6 +133,19 @@ func findRunningApplication(bundleID: String) -> NSRunningApplication? {
   }
 }
 
+/// Buckets by dBFS, not linear RMS: conversational mic speech sits around
+/// -36 dBFS RMS, which a linear 0.05 threshold (-26 dBFS) never registers.
+nonisolated func recordingWaveformIcon(level: Float) -> String {
+  let dbfs = level > 0 ? 20 * log10(level) : -Float.infinity
+  if dbfs > -30 {
+    return "waveform"
+  } else if dbfs > -45 {
+    return "waveform.mid"
+  } else {
+    return "waveform.low"
+  }
+}
+
 /// Resolves a recording-name prefix template into a concrete string.
 /// Plain substitution of YYYY/YY/MM/DD tokens - deliberately not DateFormatter,
 /// where uppercase YY/DD mean week-based year and day-of-year.
@@ -153,6 +172,24 @@ struct AudioMonitorDependencies {
   var windowTitles: @MainActor (String) -> [String]
   var now: @MainActor () -> Date
   var sleep: @Sendable (Duration) async -> Void
+  /// Called with the recording *directory* for every recording that reaches
+  /// disk, including ones ended by a recorder failure or by quit. Wired to the
+  /// transcription coordinator in `BlackboxApp`; a no-op by default so the
+  /// monitor stays independent of it.
+  ///
+  /// A directory, not the audio file: that is what `RecorderSession.stop()`
+  /// returns, and a consumer that assumed otherwise and climbed a level with
+  /// `deletingLastPathComponent()` once enqueued the whole recordings folder
+  /// as a job.
+  var onRecordingSaved: @MainActor (URL) -> Void = { _ in }
+  /// Whether Screen Recording - which is what system audio capture rides on -
+  /// is currently granted. Polled rather than inferred from a failed recording:
+  /// the menu bar used to look healthy until the first recording failed, which
+  /// meant a denied user could sit through a whole call capturing nothing.
+  /// `CGPreflightScreenCaptureAccess` is cheap and never prompts, which is
+  /// exactly what makes it safe to call on the settings poll.
+  /// Defaults to granted so tests that build this struct by hand are unaffected.
+  var screenCaptureAccessGranted: @MainActor () -> Bool = { true }
 
   static let live = AudioMonitorDependencies(
     recorderFactory: LiveRecorderSessionFactory(),
@@ -165,33 +202,36 @@ struct AudioMonitorDependencies {
           micEnabled: true,
           saveDirectory: BlackboxTestMode.saveDirectoryOverride
             ?? URL(fileURLWithPath: defaultSaveDirectoryPath),
-          notifyOnStart: false,
-          notifyOnSaved: false,
-          notifyOnError: false,
+          // Toasts stay on under --ui-test-mode so the smoke suite can assert
+          // the HUD actually fired; without this the panel never shows at all.
+          notifyOnStart: true,
+          notifyOnSaved: true,
+          notifyOnError: true,
           namePrefixTemplate: "",
           writeMixedTrack: true
         )
       }
 
       let defaults = UserDefaults.standard
-      let path = defaults.string(forKey: "saveDirectoryPath") ?? defaultSaveDirectoryPath
+      let path = defaults.string(forKey: SettingsKeys.saveDirectoryPath) ?? defaultSaveDirectoryPath
       return AudioMonitorSettings(
-        autoRecord: defaults.object(forKey: "autoRecord") as? Bool ?? true,
-        gracePeriod: defaults.double(forKey: "gracePeriod").clamped(to: 5...60, default: 5),
-        micEnabled: defaults.object(forKey: "micEnabled") as? Bool ?? true,
+        autoRecord: defaults.object(forKey: SettingsKeys.autoRecord) as? Bool ?? true,
+        gracePeriod: defaults.double(forKey: SettingsKeys.gracePeriod).clamped(
+          to: 5...60, default: 5),
+        micEnabled: defaults.object(forKey: SettingsKeys.micEnabled) as? Bool ?? true,
         saveDirectory: URL(fileURLWithPath: path),
-        notifyOnStart: defaults.object(forKey: "notifyOnStart") as? Bool ?? true,
-        notifyOnSaved: defaults.object(forKey: "notifyOnSaved") as? Bool ?? true,
-        notifyOnError: defaults.object(forKey: "notifyOnError") as? Bool ?? true,
-        namePrefixTemplate: defaults.string(forKey: "namePrefixTemplate") ?? "YYMM-DD-",
+        notifyOnStart: defaults.object(forKey: SettingsKeys.notifyOnStart) as? Bool ?? true,
+        notifyOnSaved: defaults.object(forKey: SettingsKeys.notifyOnSaved) as? Bool ?? true,
+        notifyOnError: defaults.object(forKey: SettingsKeys.notifyOnError) as? Bool ?? true,
+        namePrefixTemplate: defaults.string(forKey: SettingsKeys.namePrefixTemplate) ?? "YYMM-DD-",
         excludedBundleIDs: Set(
           AudioMonitorSettings.parseBundleIDList(
-            defaults.string(forKey: "excludedBundleIDs") ?? "")),
+            defaults.string(forKey: SettingsKeys.excludedBundleIDs) ?? "")),
         excludedTitlePatterns: Set(
           AudioMonitorSettings.parseBundleIDList(
-            defaults.string(forKey: "excludedTitlePatterns") ?? ""
+            defaults.string(forKey: SettingsKeys.excludedTitlePatterns) ?? ""
           ).map { $0.lowercased() }),
-        writeMixedTrack: defaults.object(forKey: "writeMixedTrack") as? Bool ?? true
+        writeMixedTrack: defaults.object(forKey: SettingsKeys.writeMixedTrack) as? Bool ?? true
       )
     },
     microphoneAuthorizationStatus: {
@@ -231,6 +271,7 @@ struct AudioMonitorDependencies {
     now: { Date() },
     sleep: { duration in
       try? await Task.sleep(for: duration)
-    }
+    },
+    screenCaptureAccessGranted: { CGPreflightScreenCaptureAccess() }
   )
 }

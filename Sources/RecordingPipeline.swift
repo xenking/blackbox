@@ -127,7 +127,7 @@ final class RecordingPipeline: @unchecked Sendable {
   /// starting the session on whichever track has already delivered samples.
   /// Measured in sample time (not wall clock) so it is deterministic in tests.
   nonisolated static let sessionStartTimeoutSeconds: Double = 0.5
-  nonisolated(unsafe) private var fileURL: URL?
+  nonisolated(unsafe) private var recordingDirectory: URL?
   nonisolated(unsafe) private var lastLevelTime: UInt64 = 0
   nonisolated(unsafe) private var pendingMaxLevel: Float = 0
   nonisolated(unsafe) private var writerFailureReported = false
@@ -194,12 +194,12 @@ final class RecordingPipeline: @unchecked Sendable {
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
     // Self-clean on any partial-init throw: metadata.save / AVAssetWriter
-    // init can fail with `dirURL` already on disk but `fileURL` never set.
-    // Without this, pipeline.stop() reads `fileURL` (nil) and leaves an
+    // init can fail with `dirURL` already on disk but `recordingDirectory` never
+    // set. Without this, pipeline.stop() reads it as nil and leaves an
     // orphan directory in the user's recordings folder.
     do {
-      let audioURL = dirURL.appendingPathComponent("audio.m4a")
-      Log.info(Log.recorder, "recorder", "writing to \(dirName)/audio.m4a")
+      let audioURL = dirURL.appendingPathComponent(RecordingStore.audioName)
+      Log.info(Log.recorder, "recorder", "writing to \(dirName)/\(RecordingStore.audioName)")
 
       let metadata = RecordingMetadata(
         title: titlePrefix + appName,
@@ -258,7 +258,7 @@ final class RecordingPipeline: @unchecked Sendable {
       writer = newWriter
       systemTrack = TrackState(input: systemInput)
       micTrack = TrackState(input: newMicInput)
-      fileURL = dirURL
+      recordingDirectory = dirURL
       sessionStarted = false
       sessionStartTime = .invalid
       sessionPending = true
@@ -293,6 +293,11 @@ final class RecordingPipeline: @unchecked Sendable {
   ///
   /// Do not call while any buffer source is still live - the `nonisolated(unsafe)`
   /// state inside the pipeline assumes all writes happen on audioQueue.
+  ///
+  /// Returns the recording *directory*, not the audio file inside it. Every
+  /// consumer of a saved recording works in directories - the file names are
+  /// `RecordingStore`'s business - so this hands back the directory and lets
+  /// them ask `RecordingStore.audioURL(in:)` for the audio.
   @discardableResult
   nonisolated func stop() async -> URL? {
     stopped = true
@@ -310,12 +315,12 @@ final class RecordingPipeline: @unchecked Sendable {
 
     let wasStarted = sessionStarted
     let capturedWriter = writer
-    let capturedFileURL = fileURL
+    let capturedDirectory = recordingDirectory
 
     systemTrack = TrackState()
     micTrack = TrackState()
     writer = nil
-    fileURL = nil
+    recordingDirectory = nil
     sessionStarted = false
     sessionStartTime = .invalid
     sessionPending = true
@@ -324,35 +329,47 @@ final class RecordingPipeline: @unchecked Sendable {
     guard let capturedWriter else { return nil }
     guard wasStarted else {
       capturedWriter.cancelWriting()
-      if let capturedFileURL { try? FileManager.default.removeItem(at: capturedFileURL) }
+      if let capturedDirectory { try? FileManager.default.removeItem(at: capturedDirectory) }
       return nil
     }
 
-    // Safe to capture nonisolated: finishWriting() is the terminal writer op,
-    // and the main path awaits its completion before any further access.
-    nonisolated(unsafe) let writerForTimeout = capturedWriter
-    let timeoutTask = Task.detached {
-      try await Task.sleep(for: .seconds(5))
-      Log.error(Log.recorder, "recorder", "finishWriting timed out after 5s, cancelling")
-      writerForTimeout.cancelWriting()
-    }
+    // `finishWriting` is awaited to completion and is never cancelled. An
+    // earlier version raced it against a 5s timer that called `cancelWriting`,
+    // on the theory that the result would be a truncated file. It is not:
+    // AVAssetWriter.h is explicit that "if an output file was created by the
+    // receiver during the writing process, -cancelWriting will delete the
+    // file." Finalizing a long two-track recording writes the sample tables
+    // for hours of audio, so exceeding five seconds on a loaded or nearly-full
+    // disk is ordinary - and the recording was being deleted and then reported
+    // as saved, because `.cancelled` counted as success below.
+    //
+    // Nothing is lost by waiting instead: `movieFragmentInterval` (set in
+    // `start`) means even a hard kill leaves a playable file. A slow finish is
+    // logged so it is visible without being fatal.
+    let finishStarted = ContinuousClock.now
     await capturedWriter.finishWriting()
-    timeoutTask.cancel()
+    let finishDuration = ContinuousClock.now - finishStarted
+    if finishDuration > .seconds(5) {
+      Log.info(
+        Log.recorder, "recorder",
+        "finishWriting took \(String(format: "%.1fs", Double(finishDuration.components.seconds))) - slow disk or a long recording"
+      )
+    }
 
     if capturedWriter.status == .failed {
       Log.error(
         Log.recorder, "recorder",
         "writer failed: \(capturedWriter.error?.localizedDescription ?? "unknown")")
-    } else if capturedWriter.status == .cancelled {
-      Log.error(
-        Log.recorder, "recorder",
-        "finishWriting cancelled by timeout - file may be incomplete")
+      // Deliberately still returned when something reached disk. Fragment
+      // headers make a partial file playable, and handing the user a short
+      // recording beats telling them a call they just had does not exist.
+      if let capturedDirectory, RecordingStore.audioURL(in: capturedDirectory) != nil {
+        return capturedDirectory
+      }
+      return nil
     }
 
-    if capturedWriter.status == .completed || capturedWriter.status == .cancelled {
-      return capturedFileURL
-    }
-    return nil
+    return capturedWriter.status == .completed ? capturedDirectory : nil
   }
 
   nonisolated private func startSessionIfNeeded(at pts: CMTime, track: RecordingTrackKind) {

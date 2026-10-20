@@ -13,7 +13,10 @@ final class AudioMonitor {
   private(set) var graceCountdown: TimeInterval?
   private(set) var isSaving = false
   private(set) var formattedElapsed: String?
-  private(set) var audioLevel: Float = 0
+  /// Stored rather than derived from the raw level: `@Observable` notifies on
+  /// every assignment, so publishing the 4 Hz level directly would invalidate
+  /// the menu bar label on every tick instead of only on a bucket change.
+  private(set) var levelSymbol = recordingWaveformIcon(level: 0)
   private(set) var lastSavedRecordingURL: URL?
   private var savingCount = 0
 
@@ -32,6 +35,13 @@ final class AudioMonitor {
   // returns slowly.
   private var autoStartTask: Task<Void, Never>?
   private var manualStartTask: Task<Void, Never>?
+  /// Every in-flight `recorder.stop()`. The four stop paths nil their recorder
+  /// and then launch an unstructured Task to do the stopping, so
+  /// `stopMonitoring()` - which only awaited the recorders themselves - was
+  /// awaiting two fields that were already nil. Stop a recording, quit within a
+  /// second or two, and the process exited mid-`finishWriting`, leaving a file
+  /// with no `moov` atom.
+  private var savingTasks: [UUID: Task<Void, Never>] = [:]
   // After a user-initiated stop (manual stop, or force-stop on auto), suppress
   // auto-restart of the same parent bundle until it disappears from the caller
   // set for one poll. Single-bundle: covers the reported Chrome case;
@@ -83,9 +93,11 @@ final class AudioMonitor {
       "settings loaded: autoRecord=\(autoRecord), gracePeriod=\(gracePeriod), micEnabled=\(micEnabled)"
     )
 
-    // Screen Recording permission is requested at onboarding; if it was revoked
-    // or never granted, recording fails with .permissionDenied and the failure
-    // handler sets permissionNeeded = true.
+    // Screen Recording permission is requested at onboarding. `loadSettings`
+    // above has already seeded `permissionNeeded` from a preflight, and the
+    // 5-second poll below keeps it honest if the user revokes mid-session; the
+    // recorder's `.permissionDenied` failure path sets it too, as a backstop
+    // for the window between a revoke and the next poll.
 
     if !skipPermissionRequests {
       Task { @MainActor [weak self] in
@@ -122,16 +134,12 @@ final class AudioMonitor {
     let manualTask = manualStartTask
 
     if let recorder = autoRecorder {
-      if let url = await recorder.stop() {
-        scheduleTrackMixdown(for: url)
-      }
+      await reportRecordingSaved(await recorder.stop(), renderingMixdown: false)
       autoRecorder = nil
     }
 
     if let recorder = manualRecorder {
-      if let url = await recorder.stop() {
-        scheduleTrackMixdown(for: url)
-      }
+      await reportRecordingSaved(await recorder.stop(), renderingMixdown: false)
       manualRecorder = nil
       isManualRecording = false
     }
@@ -141,17 +149,24 @@ final class AudioMonitor {
     await autoTask?.value
     await manualTask?.value
 
+    // And for any stop already in flight when quit arrived. Not bounded: only
+    // the SCStream stop inside it is (3s), and `finishWriting` after that runs
+    // as long as it runs - which is the point, since cancelling it deletes the
+    // file. The real backstop is `applicationShouldTerminate`'s own 8s reply
+    // timer; if finalization outlasts it the process exits mid-write, and the
+    // file is recoverable through `movieFragmentInterval` once the first
+    // fragment has flushed.
+    for task in savingTasks.values { await task.value }
+
     isRecording = false
     currentAppName = nil
     recordingStartTime = nil
   }
 
-  private func scheduleTrackMixdown(for recordingDirectory: URL) {
-    let writeMixedTrack = writeMixedTrack
-    Task {
-      await TrackMixdown.render(
-        recordingDirectory: recordingDirectory, includeMixedTrack: writeMixedTrack)
-    }
+  /// Quit-time only. The delegate has no HUD of its own, and a second instance
+  /// would fight this one for the panel.
+  func showFinalizingToast() {
+    dependencies.hud.showFinalizing()
   }
 
   // MARK: - Error
@@ -289,12 +304,11 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
-      if let url = await failedRecorder.stop() {
-        scheduleTrackMixdown(for: url)
-      }
+    trackSaving { [self] in
+      let url = await failedRecorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      await reportRecordingSaved(url)
     }
 
     switch failure {
@@ -305,6 +319,12 @@ final class AudioMonitor {
     case .lowDiskSpace:
       setError("Recording stopped - not enough disk space")
       updateAutoState()
+    case .displayLost:
+      // Display sleep, not a fault: restart unconditionally. start() waits for
+      // a display to come back, so this does not spin against the budget.
+      Log.info(Log.monitor, "monitor", "display lost during manual recording, restarting")
+      setError("Display slept - resuming recording...")
+      startManualRecording(resetRestartBudget: false)
     case .systemStopped, .other:
       if shouldAllowRestart(
         count: &manualRestartCount, windowStart: &manualRestartWindowStart)
@@ -315,6 +335,50 @@ final class AudioMonitor {
         setError("Recording failed repeatedly")
       }
     }
+  }
+
+  /// Runs a recorder stop as a tracked task, so `stopMonitoring()` can await it.
+  ///
+  /// The body has to be registered *and* removed from inside the task, because
+  /// the `Task` value does not exist until its initializer returns - by which
+  /// time a short body may already have finished. Inserting after the fact
+  /// would then leave a completed task in the set forever.
+  private func trackSaving(_ body: @escaping @MainActor () async -> Void) {
+    let id = UUID()
+    // Keyed by id rather than by the task itself: the `Task` value does not
+    // exist until its initializer returns, so a task cannot remove itself from
+    // a set it is not yet in. The assignment lands first regardless - this is
+    // main-actor code, so the body cannot start until the current synchronous
+    // region yields.
+    savingTasks[id] = Task { @MainActor in
+      await body()
+      savingTasks[id] = nil
+    }
+  }
+
+  /// Announces a recording that reached disk. Every `stop()` that can return a
+  /// URL funnels through here so post-processing sees failure-ended and
+  /// quit-time recordings too, not just the two clean stop paths.
+  ///
+  /// The 3-track mixdown runs first and the consumer is told afterwards:
+  /// mixdown atomically replaces `audio.m4a`, so a transcription started
+  /// beforehand would be reading a file that is swapped out from under it.
+  /// Mixdown is best-effort and never throws - on failure the original
+  /// 2-track file stays and the consumer still runs.
+  ///
+  /// Quit passes `renderingMixdown: false`: the process is about to exit, a
+  /// render cut off mid-way is wasted, and awaiting it would stretch shutdown.
+  /// The consumer is still told inline, so the job record reaches disk and the
+  /// next launch resumes it against the 2-track file, which is fully playable.
+  private func reportRecordingSaved(_ recordingDirectory: URL?, renderingMixdown: Bool = true)
+    async
+  {
+    guard let recordingDirectory else { return }
+    if renderingMixdown {
+      await TrackMixdown.render(
+        recordingDirectory: recordingDirectory, includeMixedTrack: writeMixedTrack)
+    }
+    dependencies.onRecordingSaved(recordingDirectory)
   }
 
   func forceStopAutoRecording() {
@@ -334,19 +398,25 @@ final class AudioMonitor {
     stopElapsedTimer()
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
-        scheduleTrackMixdown(for: url)
+      // `updateAutoState` first: it is what clears `isRecording`, and
+      // `reportRecordingSaved` runs a consumer that reads it. Announcing the
+      // save while the just-finished recording still reads as live made the
+      // transcription coordinator hold every automatic job behind its
+      // recording gate for the gate's full duration, every time.
+      updateAutoState()
+      if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
-      updateAutoState()
       // Force re-evaluation so auto-recording starts if a call is still active
       lastKnownMicRunning = false
       evaluateCallState()
+      // Last: the mixdown inside must not delay the next recording starting.
+      await reportRecordingSaved(url)
     }
   }
 
@@ -692,16 +762,18 @@ final class AudioMonitor {
     Log.info(Log.monitor, "monitor", "stopping auto-recording (app=\(appName))")
     savingCount += 1
     isSaving = true
-    Task {
+    trackSaving { [self] in
       let url = await recorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
-      if let url {
-        scheduleTrackMixdown(for: url)
+      // Ordered as in `stopManualRecording`, and for the same reason: the save
+      // must not be announced while `isRecording` still reads true.
+      updateAutoState()
+      if url != nil {
         lastSavedRecordingURL = url
         notifyRecordingSaved(appName: appName)
       }
-      updateAutoState()
+      await reportRecordingSaved(url)
     }
   }
 
@@ -716,12 +788,11 @@ final class AudioMonitor {
 
     savingCount += 1
     isSaving = true
-    Task {
-      if let url = await failedRecorder.stop() {
-        scheduleTrackMixdown(for: url)
-      }
+    trackSaving { [self] in
+      let url = await failedRecorder.stop()
       savingCount -= 1
       isSaving = savingCount > 0
+      await reportRecordingSaved(url)
     }
 
     switch failure {
@@ -731,6 +802,9 @@ final class AudioMonitor {
       autoRecordingAppName = nil
       autoRecordingBundleID = nil
       updateAutoState()
+    case .displayLost:
+      Log.info(Log.monitor, "monitor", "display lost during auto-recording, restarting")
+      startAutoRecording(resetRestartBudget: false)
     case .systemStopped:
       if shouldAllowRestart(
         count: &autoRestartCount, windowStart: &autoRestartWindowStart)
@@ -776,7 +850,7 @@ final class AudioMonitor {
       isRecording = false
       currentAppName = nil
       recordingStartTime = nil
-      audioLevel = 0
+      levelSymbol = recordingWaveformIcon(level: 0)
       stopElapsedTimer()
     }
   }
@@ -808,6 +882,17 @@ final class AudioMonitor {
     if micPermissionNeeded != nextMicPermissionNeeded {
       micPermissionNeeded = nextMicPermissionNeeded
     }
+
+    // Asked here rather than only after a capture fails. Recording is the whole
+    // product, so an app that cannot record has to say so before the user
+    // relies on it, not after they have lost a call to it.
+    let nextPermissionNeeded = !dependencies.screenCaptureAccessGranted()
+    if permissionNeeded != nextPermissionNeeded {
+      Log.info(
+        Log.monitor, "monitor",
+        "screen recording permission \(nextPermissionNeeded ? "missing" : "granted")")
+      permissionNeeded = nextPermissionNeeded
+    }
   }
 
   private func makeFailureHandler(isManual: Bool) -> @Sendable (RecorderFailure) -> Void {
@@ -825,8 +910,10 @@ final class AudioMonitor {
 
   private func makeAudioLevelHandler() -> @Sendable (Float) -> Void {
     { [weak self] level in
+      let symbol = recordingWaveformIcon(level: level)
       Task { @MainActor [weak self] in
-        self?.audioLevel = level
+        guard let self, self.levelSymbol != symbol else { return }
+        self.levelSymbol = symbol
       }
     }
   }
@@ -856,7 +943,9 @@ final class AudioMonitor {
       errorMessage: errorMessage,
       permissionNeeded: permissionNeeded,
       micPermissionNeeded: micPermissionNeeded,
-      lastSavedRecordingPath: lastSavedRecordingURL?.path
+      lastSavedRecordingPath: lastSavedRecordingURL?.path,
+      hudTitle: dependencies.hud.lastToast?.title,
+      hudSubtitle: dependencies.hud.lastToast?.subtitle
     )
   }
 

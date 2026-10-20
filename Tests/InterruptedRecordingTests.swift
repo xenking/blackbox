@@ -56,9 +56,7 @@ struct InterruptedRecordingTests {
     // Reaches the asset before any network call, so no key is needed.
     let service = TranscriptionService(apiKey: "not-a-real-key")
     await #expect(throws: (any Error).self) {
-      try await service.transcribe(
-        fileURL: audioURL, languageHints: ["ru"], separateTracks: true
-      ) { _ in }
+      _ = try await service.upload(fileURL: audioURL, role: .mic) { _ in }
     }
   }
 

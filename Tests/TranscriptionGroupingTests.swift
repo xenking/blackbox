@@ -99,17 +99,18 @@ struct TranscriptionGroupingTests {
       tracks: [.mixed, .mic, .system]
     )
     let map = RecordingTrackMap.resolve(metadata: metadata, trackCount: 3)
-    let jobs = TranscriptionService.planJobs(
+    let roles = TranscriptionService.planRoles(
       separateTracks: true, map: map, trackCount: 3)
 
-    #expect(jobs.map(\.role) == [.mic, .farEnd])
-    #expect(jobs.map(\.trackIndex) == [1, 2])
-    #expect(jobs.map(\.diarization) == [false, true])
+    #expect(roles == [.mic, .farEnd])
+    #expect(roles.map(TranscriptionService.diarizes) == [false, true])
 
     let mic = TranscriptionService.transcriptionConfiguration(
-      fileId: "mic", languageHints: ["ru"], enableDiarization: jobs[0].diarization)
+      model: TranscriptionService.defaultModel, fileId: "mic", languageHints: ["ru"],
+      enableDiarization: TranscriptionService.diarizes(roles[0]))
     let desktop = TranscriptionService.transcriptionConfiguration(
-      fileId: "desktop", languageHints: ["ru"], enableDiarization: jobs[1].diarization)
+      model: TranscriptionService.defaultModel, fileId: "desktop", languageHints: ["ru"],
+      enableDiarization: TranscriptionService.diarizes(roles[1]))
     #expect(mic["enable_speaker_diarization"] as? Bool == false)
     #expect(desktop["enable_speaker_diarization"] as? Bool == true)
     #expect(mic["context"] == nil)

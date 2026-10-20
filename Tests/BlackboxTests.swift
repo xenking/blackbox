@@ -112,11 +112,11 @@ struct AECProcessingTests {
     try FileManager.default.copyItem(
       at: audioURL, to: tmpDir.appending(path: "audio.m4a"))
 
-    await AECProcessor.process(recordingDirectory: tmpDir)
+    try await AECProcessor.process(recordingDirectory: tmpDir)
     return (tmpDir, tmpDir.appending(path: "audio-processed.m4a"))
   }
 
-  @Test("produces dual-track 16kHz mono output with matching duration")
+  @Test("produces dual-track 16kHz mono output with matching duration", .timeLimit(.minutes(2)))
   func outputFormat() async throws {
     let (tmpDir, outputURL) = try await processInTemp(Self.testRecording)
     defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -147,7 +147,7 @@ struct AECProcessingTests {
       "Duration mismatch: input=\(inputDur)s, output=\(outputDur)s")
   }
 
-  @Test("output properties match reference processed file")
+  @Test("output properties match reference processed file", .timeLimit(.minutes(2)))
   func matchesReference() async throws {
     let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")
@@ -179,7 +179,7 @@ struct AECProcessingTests {
       "File size: ref=\(refSize), out=\(outSize), ratio=\(String(format: "%.2f", ratio))")
   }
 
-  @Test("processed mic track contains non-silent audio")
+  @Test("processed mic track contains non-silent audio", .timeLimit(.minutes(2)))
   func micTrackNotSilent() async throws {
     let (tmpDir, outputURL) = try await processInTemp(Self.testRecording)
     defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -218,7 +218,7 @@ struct AECProcessingTests {
     #expect(peakLevel > 0.001, "Mic track appears silent (peak=\(peakLevel))")
   }
 
-  @Test("per-second RMS of mic track matches reference within tolerance")
+  @Test("per-second RMS of mic track matches reference within tolerance", .timeLimit(.minutes(2)))
   func micRMSMatchesReference() async throws {
     let refProcessedURL = try TestFixtures.recordingDirectory(named: Self.testRecording)
       .appending(path: "audio-processed.m4a")
@@ -280,6 +280,52 @@ struct AECProcessingTests {
     var sum: Float = 0
     for s in samples { sum += s * s }
     return (sum / Float(samples.count)).squareRoot()
+  }
+
+  /// Turning off "Record Microphone" produces a genuinely single-track file, and
+  /// the Remove Echo button is shown for any recording without a processed file.
+  /// The scratch-file rewrite made that combination throw a filesystem error
+  /// about a partial file the run had correctly never created.
+  @Test("single-track recording is a no-op, not an error", .timeLimit(.minutes(2)))
+  func singleTrackIsNoOp() async throws {
+    let tmpDir = FileManager.default.temporaryDirectory
+      .appending(path: "blackbox-aec-single-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    try Self.writeSingleTrackM4A(to: tmpDir.appending(path: "audio.m4a"))
+
+    let outcome = try await AECProcessor.process(recordingDirectory: tmpDir)
+
+    #expect(outcome == .nothingToProcess)
+    let processed = tmpDir.appending(path: "audio-processed.m4a")
+    #expect(!FileManager.default.fileExists(atPath: processed.path(percentEncoded: false)))
+    let leftovers = try FileManager.default.contentsOfDirectory(atPath: tmpDir.path)
+      .filter { RecordingStore.isPartialProcessedName($0) }
+    #expect(leftovers.isEmpty, "scratch file left behind: \(leftovers)")
+  }
+
+  private static func writeSingleTrackM4A(to url: URL) throws {
+    let file = try AVAudioFile(
+      forWriting: url,
+      settings: [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: 48000.0,
+        AVNumberOfChannelsKey: 1,
+        AVEncoderBitRateKey: 64_000,
+      ])
+    let format = AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+    let frames: AVAudioFrameCount = 1024
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+    buffer.frameLength = frames
+    for chunk in 0..<24 {
+      let samples = buffer.floatChannelData![0]
+      for i in 0..<Int(frames) {
+        samples[i] = sin(Float(chunk * Int(frames) + i) * 0.05) * 0.2
+      }
+      try file.write(from: buffer)
+    }
   }
 }
 
@@ -788,5 +834,37 @@ struct BundleIDListParsingTests {
       AudioMonitorSettings.parseBundleIDList(" com.a.App , com.b.App,,com.c.App ")
         == ["com.a.App", "com.b.App", "com.c.App"])
     #expect(AudioMonitorSettings.parseBundleIDList("").isEmpty)
+  }
+}
+
+@MainActor
+@Suite("Export File Names")
+struct ExportFileNameTests {
+
+  /// The title is user-editable and lands in a path the user chose, so it has
+  /// to stay one component no matter what they typed into it.
+  @Test("export file names stay inside the chosen folder")
+  func exportNamesStayContained() throws {
+    let dest = URL(fileURLWithPath: "/tmp/blackbox-export-probe")
+    let titles = [
+      "../../Documents/taxes", "..", ".", "...", " . ", ". .", "", "   ",
+      "..\\..\\windows", "a\u{2044}b", "a\u{2215}b", "a\nb", "a\u{202E}b", "~/secret",
+      "/etc/passwd", "a:b", String(repeating: "x", count: 300),
+    ]
+    let suffixes: [String?] = ["2608-27-1200-Zoom", "..", ".", "", nil]
+    for title in titles {
+      for suffix in suffixes {
+        let name = RecordingsView.exportFileName(for: title, uniqueSuffix: suffix)
+        let target = dest.appendingPathComponent(name)
+        #expect(
+          target.standardized.path.hasPrefix(dest.path + "/"),
+          "escaped: title=\(title.debugDescription) suffix=\(String(describing: suffix)) -> \(target.path)"
+        )
+        #expect(
+          target.standardized.pathComponents.count == dest.pathComponents.count + 1,
+          "depth changed: title=\(title.debugDescription) suffix=\(String(describing: suffix))"
+        )
+      }
+    }
   }
 }

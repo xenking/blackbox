@@ -286,7 +286,7 @@ SCStream sample buffers are framework-managed and potentially shared. Writing in
 
 ### SCStream error codes and recovery
 
-Full mapping from `SCError.h` in the macOS 26 SDK. Source (local path on any machine with Xcode 26 installed): `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/Headers/SCError.h`. API docs: https://developer.apple.com/documentation/screencapturekit/scstreamerrorcode
+Full mapping from `SCError.h` in the macOS 26 SDK. Source (local path on any machine with Xcode 26 installed): `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/Headers/SCError.h`. API docs: https://developer.apple.com/documentation/screencapturekit/scstreamerror/code
 
 | Code | Enum case | Since | Meaning |
 |------|-----------|-------|---------|
@@ -514,9 +514,11 @@ let hdrImage = try await SCScreenshotManager.captureImage(
 
 **ScreenCaptureKit has no documented audio-only mode, but `.audio`-only streams work in practice.** You can create an `SCStream` with `capturesAudio = true` and attach only `addStreamOutput(_:type:.audio,...)` - no `.screen` output. Audio buffers flow. Validated across macOS 14/15/26 in multiple shipping apps (Aperture, Blackbox across v0.3/v0.4/v0.6/v0.8, etc.).
 
-Two caveats that are real but not fatal:
-1. The framework logs `stream output NOT found. Dropping frame` to the console for every video frame because the **video pipeline still runs** internally even without a `.screen` consumer. Purely cosmetic noise, but it'll appear in Console.app.
-2. That same still-running video pipeline costs CPU/GPU. Mitigate by collapsing the video work to a stub (see below) even though you're not consuming it.
+Two caveats, and the second one is not cosmetic:
+1. The framework logs `stream output NOT found. Dropping frame` for every video frame when no `.screen` output is attached, because the **video pipeline still runs** internally. Attach a `.screen` output that ignores its buffers (on its own queue, not the audio queue) and the log line goes away.
+2. That still-running video pipeline costs real CPU: every frame is a WindowServer recomposite of the whole display. At the display's refresh rate on a 5K monitor this is ~15-20% of a core across the app, `replayd`, and WindowServer for the entire recording. Throttle it with `minimumFrameInterval` (below).
+
+**`minimumFrameInterval` trap.** The property is the *minimum time between frames*, so a larger value means fewer frames. `CMTime(value: 1, timescale: CMTimeScale.max)` - which reads like "infinite interval" - is ~0.5 ns, the smallest positive interval expressible, and the SDK documents `kCMTimeZero` as "capture at display's native refresh rate". It requests the *maximum* frame rate. One shipping recorder ran with that line from v0.8.0 to v0.9.1 before a user measured the 60 fps recomposite (blackbox#17). `CMTime(value: 1, timescale: 1)` is 1 fps; same shape as the `1/60` used for 60 fps elsewhere in this file.
 
 **Do not reach for CATap as the "zero-overhead" replacement without reading `core-audio-tap.md` first.** Production experience (one call-recorder shipped CATap in v0.7.0 and reverted to display-wide SCStream in v0.8.0 five days later) shows CATap has structural clock-fragility: its IO proc is driven by the hardware output clock, so when that clock is idle, pinned by Bluetooth HFP, or stalled, buffers stop flowing silently. Display-wide SCStream's clock comes from the OS-composited mix and is decoupled from hardware output, making it more robust for long-duration recording even with the cosmetic video-pipeline overhead. CATap is the right tool when you specifically need sub-20 ms capture latency (real-time AEC, live analysis); for disk-bound recording workloads (calls, meetings, lectures), SCStream wins on reliability.
 
@@ -529,13 +531,14 @@ config.sampleRate = 48000
 config.channelCount = 2
 config.excludesCurrentProcessAudio = true
 
-// Minimal video to avoid error logs
+// Minimal video: 2x2 at 1 fps. NOT 1/Int32.max - that is ~0s = native refresh rate.
 config.width = 2
 config.height = 2
-config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-// For audio-only, add only the .audio output. For combined capture:
-try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: nil)
+// Subscribe .screen even for audio-only (ignore its buffers), or SCStream logs a
+// dropped frame per frame. Keep it off the audio queue so video can never delay audio.
+try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
 ```
 
@@ -1177,7 +1180,7 @@ class AppAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         config.excludesCurrentProcessAudio = true
         config.width = 2
         config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale.max)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)  // 1 fps, not 1/Int32.max
 
         writer = try AVAssetWriter(url: url, fileType: .m4a)
         audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
@@ -1289,3 +1292,150 @@ class DisplayRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegate {
 | SCContentSharingPicker, SCScreenshotManager | 14.0 |
 | SCRecordingOutput, SCStreamOutputType.microphone | 15.0 |
 | HDR capture, configuration presets | 15.0 |
+
+## `synchronizationClock`: aligning SCStream with other capture sources
+
+`SCStream.synchronizationClock` exposes the `CMClock` that SCStream timestamps its buffers against. When you mix SCStream output with a second pipeline - an `AVAudioEngine` mic tap, a `CATap`, an `AVCaptureSession` - both sides must be expressed in the same time base or the muxed result drifts even though each track is individually correct.
+
+```swift
+if let clock = stream.synchronizationClock {
+    session.synchronizationClock = clock       // AVCaptureSession
+    // or convert a host-time stamp into the stream's base
+    let streamTime = CMSyncConvertTime(hostTime, from: CMClockGetHostTimeClock(), to: clock)
+}
+```
+
+Do this instead of subtracting a captured "start host time" from both sides - that approximation accumulates error over long recordings and is a common cause of audio slowly sliding against video.
+
+## Screenshots: `SCScreenshotConfiguration` (macOS 26+)
+
+`SCScreenshotManager.captureImage(contentFilter:configuration:)` takes an `SCStreamConfiguration`, which means single-frame capture inherits stream semantics it does not need. macOS 26 adds a dedicated path:
+
+```swift
+let config = SCScreenshotConfiguration()
+config.width = 3840
+config.height = 2160
+config.dynamicRange = .high          // HDR without the stream preset dance
+config.includesCursor = false
+
+let output = try await SCScreenshotManager.captureScreenshot(
+    contentFilter: filter, configuration: config
+)
+let image = output.cgImage
+```
+
+Prefer this over `SCStreamConfiguration(preset: .captureHDRScreenshotLocalDisplay)` on macOS 26+; the preset route remains correct for 14/15 back-deployment.
+
+## Presenter Overlay delegate callbacks
+
+When the user turns on Presenter Overlay (the camera-overlay feature in video calls), the system reshapes your capture. `SCStreamDelegate` gets told, and most implementations silently ignore it:
+
+```swift
+func stream(_ stream: SCStream, outputVideoEffectDidStartFor screen: SCStream) {
+    // Overlay active - your frames now include the camera composite
+}
+func stream(_ stream: SCStream, outputVideoEffectDidStopFor screen: SCStream) { }
+```
+
+Set `config.presenterOverlayPrivacyAlertSetting` to control whether the system shows its privacy alert. If your app records for later playback rather than live presentation, handling these callbacks lets you warn the user that an overlay is being baked into the recording.
+
+## `SCStreamConfiguration` properties worth knowing
+
+Beyond `width`/`height`/`capturesAudio`/`minimumFrameInterval`:
+
+| Property | Use |
+|---|---|
+| `sourceRect` | Capture a sub-region of the display without post-cropping |
+| `destinationRect` | Place captured content within the output surface |
+| `preservesAspectRatio` | Letterbox instead of stretching when the rects disagree |
+| `showMouseClicks` | Visualize clicks - useful for tutorial/demo recording |
+| `includeChildWindows` | Include or exclude child windows of a captured window |
+| `capturesShadowsOnly` | Window shadows without the window |
+| `colorMatrix` | Override the YCbCr matrix for the output pixel buffers |
+| `ignoreGlobalClipDisplay` / `ignoreGlobalClipSingleWindow` | Bypass global clipping behavior |
+
+## Trap: a mono downmix that assumes interleaved layout
+
+A `resampleToMono` helper that indexes `floatChannelData[0]` as `[L, R, L, R, ...]` is only correct for an **interleaved** buffer. `AVAudioPCMBuffer` is frequently **planar (non-interleaved)**, where `floatChannelData[0]` is the entire left channel and the right channel lives at `floatChannelData[1]`.
+
+Feed a planar buffer to interleaved-indexing code and you average two adjacent *left* samples and never read the right channel at all. The output is audibly wrong but not silent - it passes a smoke test and ships.
+
+```swift
+func downmixToMono(_ buffer: AVAudioPCMBuffer) -> [Float] {
+    guard let data = buffer.floatChannelData else { return [] }
+    let frames = Int(buffer.frameLength)
+    let channels = Int(buffer.format.channelCount)
+    guard channels > 1 else { return Array(UnsafeBufferPointer(start: data[0], count: frames)) }
+
+    var mono = [Float](repeating: 0, count: frames)
+    if buffer.format.isInterleaved {
+        let p = data[0]
+        for i in 0..<frames {
+            mono[i] = (p[i * channels] + p[i * channels + 1]) * 0.5
+        }
+    } else {
+        let left = data[0], right = data[1]
+        for i in 0..<frames {
+            mono[i] = (left[i] + right[i]) * 0.5
+        }
+    }
+    return mono
+}
+```
+
+Always branch on `buffer.format.isInterleaved`. Test with hostile stereo - opposite-polarity channels sum to silence under a correct downmix and to a full-amplitude signal under the broken one, which makes the bug unmissable.
+
+## Trap: a stale TCC row from a superseded signing identity
+
+After switching signing identity - ad-hoc or self-signed during development, then Developer ID for release - System Settings can still list the app under Screen Recording with the toggle **on**, while `CGPreflightScreenCaptureAccess()` returns `false` and the app re-prompts on every launch. The visible UI and the API disagree because the stored grant is keyed to the old signature.
+
+There is no programmatic fix. The user must:
+
+1. System Settings > Privacy & Security > Screen & System Audio Recording
+2. Select the stale row, click **-** to delete it
+3. Deny the pending prompt, quit and relaunch the app
+4. Grant again against the new identity
+
+After that, TCC keys on team ID plus bundle ID and the grant survives subsequent rebuilds. Frame this to users as a one-time cost of the identity migration, not a bug - and avoid shipping a build signed with a different identity than the one testers already granted.
+
+## Trap: mic tap dies on an output-device switch with no notification
+
+Switching the **output** device can tear down and rebuild the capture graph without `AVAudioEngineConfigurationChange` firing for the **input** side. The mic tap stays attached to a dead graph and delivers no buffers for the remainder of the recording - no error, no log line, no callback.
+
+Do not rely on the notification alone as your recovery trigger. After any capture-path rebuild, run a bounded staleness check:
+
+```swift
+private func verifyMicAlive(after rebuild: Date) async {
+    try? await Task.sleep(for: .milliseconds(400))
+    if lastMicBufferAt < rebuild {
+        await teardownEngine()      // full teardown, not reuse
+        await buildEngine()
+    }
+}
+```
+
+Recreate the engine rather than reusing the existing graph - reattaching a tap to the stale engine reproduces the same dead state.
+
+## Remaining API surface not covered above
+
+Small but real gaps, grouped by availability.
+
+**macOS 15.2+ - stream activity callbacks.** `SCStreamDelegate` gained `streamDidBecomeActive(_:)` and `streamDidBecomeInactive(_:)`. The system can idle a stream (for example when its content is fully occluded) without stopping it, so a UI that infers "recording" from `startCapture()` alone drifts out of sync with reality. Drive your recording indicator from these callbacks rather than from your own start/stop flags.
+
+**`SCStreamConfiguration.Preset`.** Apple ships presets that set a coherent group of properties (resolution, pixel format, color space) for common capture intents. Prefer a preset as the starting point and override individual properties afterwards, rather than hand-setting a dozen fields and discovering later that the color space did not match the pixel format.
+
+**`SCScreenshotOutput`** complements `SCScreenshotManager`: it delivers screenshot results through the stream-output pipeline instead of a one-shot call, which is what you want when the screenshot has to be consistent with the frames around it.
+
+**macOS 27 beta additions.** `SCStream.isCapturing` finally exposes the stream's own state as a property rather than something you track alongside it. `SCClipBufferingOutput` buffers a rolling window so an app can retroactively save "the last N seconds" - the retroactive-clip pattern that previously required a hand-rolled ring buffer over `SCStreamOutput`. `SCRecordingEditor` edits a recording produced by `SCRecordingOutput` without dropping to AVFoundation.
+
+Note that `/documentation/updates/screencapturekit` is stale at June 2024 and lists none of the above - the framework symbol index and the release notes are the only usable change log for ScreenCaptureKit.
+
+## Transcription: SpeechAnalyzer (macOS 26+)
+
+The capture pipeline in this file ends at a file or buffer. `SpeechAnalyzer` - "analyzes spoken audio content in various ways and manages the analysis session" - is the on-device consumer for it, with `SpeechTranscriber` as "a speech-to-text transcription module that's appropriate for normal conversation and general purposes."
+
+It pairs directly with the two audio paths documented above: feed it the `AVAudioPCMBuffer`s you already convert from `CMSampleBuffer` for system audio, or the buffers from the `AVAudioEngine` mic tap. Because both run on device, a capture-plus-transcribe feature needs no network access and no additional privacy disclosure beyond the microphone and screen-recording TCC grants already covered in the Permissions section.
+
+Note the layering: `SpeechAnalyzer` handles transcription (audio to text). Summarizing or extracting structure from that text is a separate step - see `foundation-models.md` for the on-device model, which is the natural next stage of the same pipeline.
+
+Docs: <https://developer.apple.com/documentation/speech/speechanalyzer>

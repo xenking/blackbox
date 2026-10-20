@@ -52,15 +52,41 @@ spctl --assess --type execute MyApp.app
 
 If a running signed app is killed at idle right after a rebuild (e.g. a `make run` loop that replaces the `.app` under the running process), the crash is `SIGKILL` with `EXC_CRASH (Code Signature Invalid)` - not a bug in your code. macOS validates memory-mapped code pages against the on-disk signature lazily; overwriting the bundle invalidates the pages the kernel later faults in, so it terminates the process. Quit the old instance before replacing the bundle, or launch from a copied path.
 
+## Building an existing `.xcodeproj` from the command line
+
+Signing an `.xcodeproj` via `xcodebuild` fails in ways that still report `BUILD SUCCEEDED`. These are the traps that cost the most time.
+
+**`BUILD SUCCEEDED` does not mean "signed as you asked."** When the pbxproj declares an SDK-conditional identity - `CODE_SIGN_IDENTITY[sdk=macosx*] = "Apple Development"` - a command-line override can be *accepted, logged, and then ignored*. The log prints `note: Using codesigning identity override: <hash>` and the build still emits an ad-hoc-signed bundle. An `.xcconfig` setting `CODE_SIGN_IDENTITY = -` outranks both the pbxproj conditional and the command line. Two defences:
+
+```bash
+# 1. Refuse to silently fall back to ad-hoc
+xcodebuild -scheme MyApp CODE_SIGNING_REQUIRED=YES ...
+
+# 2. Never trust the build log - verify the artifact
+codesign -dv --verbose=4 build/MyApp.app 2>&1 | grep -E 'Authority|Signature|flags'
+```
+
+`Signature=adhoc` in that output means unsigned for every practical purpose: no Developer ID, no notarization, no stable TCC identity.
+
+**Bracketed build settings cannot be passed on the command line at all.** `xcodebuild` splits each `SETTING=VALUE` argument on the *first* `=`, so `CODE_SIGN_IDENTITY[sdk=macosx*]=X` parses as the setting name `CODE_SIGN_IDENTITY[sdk` with the value `macosx*]=X`. To change a conditional identity, edit the pbxproj or supply an `.xcconfig` - there is no CLI form.
+
+**Match the identity by name, not by prefix.** Scripts that auto-detect a certificate with `security find-identity | grep "Apple Development: "` can never match a `Developer ID Application` certificate - different certificate class, and no environment variable or rename fixes it. Match on the exact keychain name you intend to use, or build ad-hoc and re-sign the bundle inside-out (frameworks -> dylibs -> XPC services -> app).
+
+**Build from the resolved real path.** Building through a symlinked source directory corrupts Xcode's build database: you get `Stale file ... outside of the allowed root paths` and a module-emit failure, often with **no `error:` line anywhere in the log**. Delete the derived-data directory and rebuild from the fully resolved path (`cd "$(realpath .)"`).
+
+**Signature-class changes cost one round of TCC re-prompts.** Switching a bundle between ad-hoc and Developer ID changes its code identity, so the system asks for screen-recording and microphone consent once more. That is expected. Also expected: `spctl -a -vv` reporting `rejected / Unnotarized Developer ID` for a locally signed build - Gatekeeper acts on the quarantine attribute, which `xattr -cr MyApp.app` clears.
+
+**Moving a signed `.app` preserves its TCC grants and preferences.** TCC keys off bundle identifier plus signature, not path, so relocating a bundle does not reset permissions. The safe replace idiom is quit the app, `ditto` the new bundle into place, then `xattr -cr` it.
+
 ## App Store Distribution
 
 ### Requirements
 - Active Apple Developer Program membership ($99/year)
 - App Store Connect listing with metadata, screenshots
-- **Starting April 28, 2026**: uploads to App Store Connect must be built with **Xcode 26 and the iOS 26 / iPadOS 26 / tvOS 26 / visionOS 26 / watchOS 26 SDK**. Pure macOS apps are **not** in Apple's list as of 2026-04-24; Mac Catalyst and Designed-for-iPad builds inherit the iOS 26 SDK requirement. Source: https://developer.apple.com/news/?id=ueeok6yw and https://developer.apple.com/news/upcoming-requirements
+- **Since April 28, 2026**: uploads to App Store Connect must be built with **Xcode 26 and the iOS 26 / iPadOS 26 / tvOS 26 / visionOS 26 / watchOS 26 SDK**. Pure macOS apps are **not** in Apple's list as of 2026-04-24; Mac Catalyst and Designed-for-iPad builds inherit the iOS 26 SDK requirement. Source: https://developer.apple.com/news/?id=ueeok6yw and https://developer.apple.com/news/upcoming-requirements
 - Sandbox entitlement required
 - App Review compliance
-- Audit `PrivacyInfo.xcprivacy` against the current required-reason APIs list (https://developer.apple.com/documentation/bundleresources/privacy_manifest_files/describing_use_of_required_reason_api) — Apple updates it periodically
+- Audit `PrivacyInfo.xcprivacy` against the current required-reason APIs list (https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api) — Apple updates it periodically
 
 ### Workflow
 1. Archive: Product > Archive in Xcode
@@ -102,12 +128,24 @@ xcodebuild -exportArchive \
   -exportPath build/export \
   -exportOptionsPlist ExportOptions.plist
 
-# Or upload directly
-xcrun altool --upload-app \
-  -f build/export/MyApp.pkg \
-  -t macos \
-  --apiKey KEY_ID \
-  --apiIssuer ISSUER_ID
+# Or upload directly. Use notarytool - NOT `altool --upload-app`:
+# the notary service stopped accepting altool uploads on 2023-11-01,
+# and the flag is absent from Xcode 26.6's altool --help.
+xcrun notarytool submit build/export/MyApp.pkg \
+  --key AuthKey_KEYID.p8 \
+  --key-id KEY_ID \
+  --issuer ISSUER_ID \
+  --wait
+```
+
+### Notarize-then-export in one archive flow
+
+`xcodebuild` can export an already-notarized archive directly, which avoids re-signing between notarization and distribution:
+
+```bash
+xcodebuild -exportNotarizedApp \
+  -archivePath build/MyApp.xcarchive \
+  -exportPath build/notarized
 ```
 
 ## Developer ID Distribution
@@ -262,7 +300,9 @@ First notarization submissions from a new Developer ID can sit "In Progress" for
 
 ### Gatekeeper bypass for non-notarized builds
 
-Developer ID-signed but non-notarized apps show Gatekeeper warnings. Users can bypass: right-click the app > Open > click "Open" in the dialog (one-time). Or: System Settings > Privacy & Security > "Open Anyway".
+Developer ID-signed but non-notarized apps show Gatekeeper warnings. **The Control-click (right-click) > Open override was removed in macOS Sequoia and is still gone in Tahoe 26** - do not tell users to use it.
+
+The only supported path now: try to open the app once (so the block is registered), then System Settings > Privacy & Security > scroll down > **Open Anyway** > confirm. Apple's [current documentation](https://support.apple.com/en-us/102445) describes this flow exclusively. The app is then saved as an exception and opens by double-click thereafter.
 
 ### Sparkle EdDSA signing
 
@@ -411,3 +451,69 @@ struct MyApp: App {
     }
 }
 ```
+
+## Notarization rejections: check these first
+
+`com.apple.security.get-task-allow` is the single most common cause. It is the debug entitlement Xcode injects into Debug builds; if it survives into the archive you submit, the notary service rejects the upload. Verify before submitting:
+
+```bash
+codesign -d --entitlements - --xml build/export/MyApp.app | plutil -p -
+```
+
+If `get-task-allow` appears with value `true`, you archived a Debug configuration or a custom entitlements file carries it. Strip it from the Release entitlements.
+
+Other frequent blockers:
+
+- Hardened Runtime not enabled on every executable in the bundle (not just the main one).
+- A nested binary signed with a different Team ID, or left unsigned.
+- **Plug-in entitlement inheritance**: "Shared libraries, frameworks, and in-process plug-ins inherit the entitlements of their host executable." The host app must declare every entitlement its plug-ins need - a plug-in cannot add its own.
+
+Reference: [Resolving common notarization issues](https://developer.apple.com/documentation/security/resolving-common-notarization-issues).
+
+## Enhanced Security capability (Xcode 26+)
+
+Xcode 26 added an **Enhanced Security** capability enabling additional runtime and compile-time protections - pointer authentication, hardened heap, memory tagging - via the `com.apple.security.hardened-process.*` entitlement family.
+
+The entitlement schema changed again in Xcode 26.4: `-version` became `-version-string` and `-platform-restrictions` became `-platform-restrictions-string`. If you hand-maintain an entitlements plist rather than using the capability UI, re-check the key spellings against the [Security entitlements reference](https://developer.apple.com/documentation/bundleresources/security-entitlements) when moving between Xcode versions.
+
+## Installer packages
+
+For apps that need an installer rather than a drag-to-Applications DMG:
+
+```bash
+pkgbuild --root build/export/MyApp.app \
+  --identifier com.example.myapp \
+  --version 1.0.0 \
+  --install-location /Applications/MyApp.app \
+  build/MyApp-component.pkg
+
+productbuild --distribution Distribution.xml \
+  --package-path build \
+  build/MyApp.pkg
+
+productsign --sign "Developer ID Installer: Your Name (TEAMID)" \
+  build/MyApp.pkg build/MyApp-signed.pkg
+```
+
+Note the identity is **Developer ID Installer**, a different certificate from the **Developer ID Application** identity used for the app itself.
+
+Useful `notarytool` subcommands beyond `submit`:
+
+```bash
+xcrun notarytool history --key ... --key-id ... --issuer ...
+xcrun notarytool log <submission-id> --key ... --key-id ... --issuer ...
+xcrun notarytool info <submission-id> -f json --key ... --key-id ... --issuer ...
+```
+
+`--s3-acceleration` speeds up large uploads. `stapler validate <path>` verifies a stapled ticket.
+
+## Homebrew cask as a second install channel
+
+A signed, notarized Mac app can ship through a Homebrew tap alongside the DMG. Practical constraints, in the order they usually bite:
+
+- **Pick a globally unique cask token.** Tap CI (`brew test-bot --only-tap-syntax`) fails if your token collides with one in homebrew-core, and renaming later orphans every existing install.
+- **If you must rename, ship `cask_renames.json`** in the tap so `brew update` migrates existing installs. `tap_migrations.json` is for cross-tap moves and will not do this.
+- **Set `auto_updates true`** when the app self-updates via Sparkle, so Homebrew does not fight the in-app updater. Add a `livecheck` block so version bumps are detectable.
+- **`depends_on macos:` cannot express a point release** (e.g. 26.1). Enforce a precise minimum in the app at launch and treat the cask constraint as approximate.
+- **Reinstalling over an app already in `/Applications` fails** without `--force`.
+- Run `brew style` and `brew audit --cask` before pushing; generated casks commonly trip on a redundant `version` line.
