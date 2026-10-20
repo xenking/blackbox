@@ -384,6 +384,48 @@ fn bad_arguments_are_protocol_errors_and_a_missing_index_is_a_readable_tool_erro
 }
 
 #[test]
+fn an_index_still_being_created_and_an_unreadable_one_say_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(dir.path());
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 0")
+        .unwrap();
+    let mut s = StdioClient::start(&db);
+    let reply = s.call(
+        "tools/call",
+        json!({"name": "index_status", "arguments": {}}),
+    );
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("still being created"),
+        "{reply}"
+    );
+    drop(s);
+
+    // A directory the process may not enter is a permission problem, not a missing index.
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::copy(&db, locked.join("transcripts.sqlite")).unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let mut s = StdioClient::start(&locked.join("transcripts.sqlite"));
+    let reply = s.call(
+        "tools/call",
+        json!({"name": "index_status", "arguments": {}}),
+    );
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Full Disk Access"),
+        "{reply}"
+    );
+}
+
+#[test]
 fn refuses_a_schema_version_it_was_not_written_for() {
     let dir = tempfile::tempdir().unwrap();
     let db = fixture(dir.path());

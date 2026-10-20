@@ -84,8 +84,25 @@ impl Store {
 
     pub fn open(&self) -> Result<Connection, StoreError> {
         let path = self.db_path();
-        if !path.exists() {
-            return Err(StoreError::NoIndex(path));
+        // `metadata`, not `exists()`: `exists()` is false for *any* error, which would turn
+        // a permission problem into a misleading "no index yet".
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::NoIndex(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(StoreError::Db(format!(
+                    "macOS denied access to {} - the save folder is in a protected location (Documents, Desktop, iCloud...). Grant blackbox-mcp Full Disk Access in System Settings > Privacy & Security, or move the Blackbox library out of it",
+                    path.display()
+                )));
+            }
+            Err(e) => {
+                return Err(StoreError::Db(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )));
+            }
         }
         let conn = Connection::open_with_flags(
             &path,
@@ -102,6 +119,13 @@ impl Store {
             |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|s| s.to_lowercase())),
         )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // The app creates the tables and only then stamps the version, so a reader that lands in
+        // between sees 0. That is "not ready yet", not an incompatible schema.
+        if version == 0 {
+            return Err(StoreError::Db(
+                "the transcript index is still being created - try again in a moment".into(),
+            ));
+        }
         if version != SCHEMA_VERSION {
             return Err(StoreError::Db(format!(
                 "transcript index schema is v{version}, this server understands v{SCHEMA_VERSION} - update Blackbox and blackbox-mcp together"

@@ -115,7 +115,7 @@ pub fn render_plist(
   <key>KeepAlive</key>
   <true/>
   <key>ThrottleInterval</key>
-  <integer>10</integer>
+  <integer>30</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
